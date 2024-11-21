@@ -178,13 +178,45 @@ class DecoderADT(torch.nn.Module):
 
         return py_, log_pro_back_mean
 
+class DecoderSplice(torch.nn.Module):
+    """Decoder for just splicing junctions."""
+
+    def __init__(
+        self,
+        n_input: int,
+        n_output:int,
+        n_cat_list: Iterable[int] = None,
+        n_layers: int = 2,
+        n_hidden: int = 128,
+        dropout_rate: float = 0.1,
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = True,
+        deep_inject_covariates: bool = False,
+    ):
+        super().__init__()
+
+        self.ps_decoder = FCLayers(
+            n_in=n_input,
+            n_out=n_output,
+            n_cat_list=n_cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+            use_batch_norm=use_batch_norm,
+            use_layer_norm=use_layer_norm,
+        )
+    def forward(self, z: torch.Tensor, *cat_list: int):
+        """Forward pass."""
+        ps = self.py_back_decoder(z, *cat_list)
+        return ps
+
 
 class MULTIVAESPLICE(BaseModuleClass):
     """Variational auto-encoder model for joint paired + unpaired RNA-seq and ATAC-seq data.
 
     Parameters
     ----------
-    n_input_regions
+    n_input_junctions
         Number of input regions.
     n_input_genes
         Number of input genes.
@@ -259,11 +291,11 @@ class MULTIVAESPLICE(BaseModuleClass):
         RNA distribution.
     """
 
-    # TODO: replace n_input_regions and n_input_genes with a gene/region mask (we don't dictate
+    # TODO: replace n_input_junctions and n_input_genes with a gene/region mask (we don't dictate
     # which comes first or that they're even contiguous)
     def __init__(
         self,
-        n_input_regions: int = 0,
+        n_input_junctions: int = 0,
         n_input_genes: int = 0,
         n_input_proteins: int = 0,
         modality_weights: Literal["equal", "cell", "universal"] = "equal",
@@ -294,14 +326,14 @@ class MULTIVAESPLICE(BaseModuleClass):
         super().__init__()
 
         # INIT PARAMS
-        self.n_input_regions = n_input_regions
+        self.n_input_junctions = n_input_junctions
         self.n_input_genes = n_input_genes
         self.n_input_proteins = n_input_proteins
         if n_hidden is None:
-            if n_input_regions == 0:
+            if n_input_junctions == 0:
                 self.n_hidden = np.min([128, int(np.sqrt(self.n_input_genes))])
             else:
-                self.n_hidden = int(np.sqrt(self.n_input_regions))
+                self.n_hidden = int(np.sqrt(self.n_input_junctions))
         else:
             self.n_hidden = n_hidden
         self.n_batch = n_batch
@@ -393,14 +425,14 @@ class MULTIVAESPLICE(BaseModuleClass):
             scale_activation="softplus" if use_size_factor_key else "softmax",
         )
 
-        # accessibility
-        # accessibility encoder
-        if self.n_input_regions == 0:
+        # splicing
+        # splicing encoder
+        if self.n_input_junctions == 0:
             input_acc = 1
         else:
-            input_acc = self.n_input_regions
+            input_acc = self.n_input_junctions
         n_input_encoder_acc = input_acc + n_continuous_cov * encode_covariates
-        self.z_encoder_accessibility = Encoder(
+        self.z_encoder_splicing = Encoder(
             n_input=n_input_encoder_acc,
             n_layers=self.n_layers_encoder,
             n_output=self.n_latent,
@@ -415,32 +447,15 @@ class MULTIVAESPLICE(BaseModuleClass):
             return_dist=False,
         )
 
-        # accessibility region-specific factors
-        self.region_factors = None
-        if region_factors:
-            self.region_factors = torch.nn.Parameter(torch.zeros(self.n_input_regions))
-
-        # accessibility decoder
-        self.z_decoder_accessibility = DecoderPeakVI(
+        # splicing decoder
+        self.z_decoder_splicing = DecoderSplice(
             n_input=self.n_latent + self.n_continuous_cov,
-            n_output=n_input_regions,
+            n_output=n_input_junctions,
             n_hidden=self.n_hidden,
             n_cat_list=cat_list,
             n_layers=self.n_layers_decoder,
             use_batch_norm=self.use_batch_norm_decoder,
             use_layer_norm=self.use_layer_norm_decoder,
-            deep_inject_covariates=self.deeply_inject_covariates,
-        )
-
-        # accessibility library size encoder
-        self.l_encoder_accessibility = DecoderPeakVI(
-            n_input=n_input_encoder_acc,
-            n_output=1,
-            n_hidden=self.n_hidden,
-            n_cat_list=encoder_cat_list,
-            n_layers=self.n_layers_encoder,
-            use_batch_norm=self.use_batch_norm_encoder,
-            use_layer_norm=self.use_layer_norm_encoder,
             deep_inject_covariates=self.deeply_inject_covariates,
         )
 
@@ -521,7 +536,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         self.n_obs = n_obs
         self.modality_weights = modality_weights
         self.modality_penalty = modality_penalty
-        self.n_modalities = int(n_input_genes > 0) + int(n_input_regions > 0)
+        self.n_modalities = int(n_input_genes > 0) + int(n_input_junctions > 0)
         max_n_modalities = 3
         if modality_weights == "equal":
             mod_weights = torch.ones(max_n_modalities)
@@ -572,22 +587,22 @@ class MULTIVAESPLICE(BaseModuleClass):
             x_rna = torch.zeros(x.shape[0], 1, device=x.device, requires_grad=False)
         else:
             x_rna = x[:, : self.n_input_genes]
-        if self.n_input_regions == 0:
-            x_chr = torch.zeros(x.shape[0], 1, device=x.device, requires_grad=False)
+        if self.n_input_junctions == 0:
+            x_junc = torch.zeros(x.shape[0], 1, device=x.device, requires_grad=False)
         else:
-            x_chr = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_regions)]
+            x_junc = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)]
 
         mask_expr = x_rna.sum(dim=1) > 0
-        mask_acc = x_chr.sum(dim=1) > 0
+        mask_spl = x_junc.sum(dim=1) > 0
         mask_pro = y.sum(dim=1) > 0
 
         if cont_covs is not None and self.encode_covariates:
             encoder_input_expression = torch.cat((x_rna, cont_covs), dim=-1)
-            encoder_input_accessibility = torch.cat((x_chr, cont_covs), dim=-1)
+            encoder_input_splicing = torch.cat((x_junc, cont_covs), dim=-1)
             encoder_input_protein = torch.cat((y, cont_covs), dim=-1)
         else:
             encoder_input_expression = x_rna
-            encoder_input_accessibility = x_chr
+            encoder_input_splicing = x_junc
             encoder_input_protein = y
 
         if cat_covs is not None and self.encode_covariates:
@@ -596,8 +611,8 @@ class MULTIVAESPLICE(BaseModuleClass):
             categorical_input = ()
 
         # Z Encoders
-        qzm_acc, qzv_acc, z_acc = self.z_encoder_accessibility(
-            encoder_input_accessibility, batch_index, *categorical_input
+        qzm_spl, qzv_spl, z_spl = self.z_encoder_splicing(
+            encoder_input_splicing, batch_index, *categorical_input
         )
         qzm_expr, qzv_expr, z_expr = self.z_encoder_expression(
             encoder_input_expression, batch_index, *categorical_input
@@ -610,9 +625,6 @@ class MULTIVAESPLICE(BaseModuleClass):
         libsize_expr = self.l_encoder_expression(
             encoder_input_expression, batch_index, *categorical_input
         )
-        libsize_acc = self.l_encoder_accessibility(
-            encoder_input_accessibility, batch_index, *categorical_input
-        )
 
         # mix representations
         if self.modality_weights == "cell":
@@ -621,11 +633,11 @@ class MULTIVAESPLICE(BaseModuleClass):
             weights = self.mod_weights.unsqueeze(0).expand(len(cell_idx), -1)
 
         qz_m = mix_modalities(
-            (qzm_expr, qzm_acc, qzm_pro), (mask_expr, mask_acc, mask_pro), weights
+            (qzm_expr, qzm_spl, qzm_pro), (mask_expr, mask_spl, mask_pro), weights
         )
         qz_v = mix_modalities(
-            (qzv_expr, qzv_acc, qzv_pro),
-            (mask_expr, mask_acc, mask_pro),
+            (qzv_expr, qzm_spl, qzv_pro),
+            (mask_expr, mask_spl, mask_pro),
             weights,
             torch.sqrt,
         )
@@ -636,19 +648,18 @@ class MULTIVAESPLICE(BaseModuleClass):
             def unsqz(zt, n_s):
                 return zt.unsqueeze(0).expand((n_s, zt.size(0), zt.size(1)))
 
-            untran_za = Normal(qzm_acc, qzv_acc.sqrt()).sample((n_samples,))
-            z_acc = self.z_encoder_accessibility.z_transformation(untran_za)
+            untran_za = Normal(qzm_spl, qzv_spl.sqrt()).sample((n_samples,))
+            z_spl = self.z_encoder_splicing.z_transformation(untran_za)
             untran_ze = Normal(qzm_expr, qzv_expr.sqrt()).sample((n_samples,))
             z_expr = self.z_encoder_expression.z_transformation(untran_ze)
             untran_zp = Normal(qzm_pro, qzv_pro.sqrt()).sample((n_samples,))
             z_pro = self.z_encoder_protein.z_transformation(untran_zp)
 
             libsize_expr = unsqz(libsize_expr, n_samples)
-            libsize_acc = unsqz(libsize_acc, n_samples)
 
         # sample from the mixed representation
         untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
-        z = self.z_encoder_accessibility.z_transformation(untran_z)
+        z = self.z_encoder_splicing.z_transformation(untran_z)
 
         outputs = {
             "z": z,
@@ -657,14 +668,13 @@ class MULTIVAESPLICE(BaseModuleClass):
             "z_expr": z_expr,
             "qzm_expr": qzm_expr,
             "qzv_expr": qzv_expr,
-            "z_acc": z_acc,
-            "qzm_acc": qzm_acc,
-            "qzv_acc": qzv_acc,
+            "z_spl": z_spl,
+            "qzm_spl": qzm_spl,
+            "qzv_spl": qzv_spl,
             "z_pro": z_pro,
             "qzm_pro": qzm_pro,
             "qzv_pro": qzv_pro,
             "libsize_expr": libsize_expr,
-            "libsize_acc": libsize_acc,
         }
         return outputs
 
@@ -732,8 +742,8 @@ class MULTIVAESPLICE(BaseModuleClass):
         else:
             decoder_input = torch.cat([latent, cont_covs], dim=-1)
 
-        # Accessibility Decoder
-        p = self.z_decoder_accessibility(decoder_input, batch_index, *categorical_input)
+        # Splicing Decoder
+        p_s = self.z_decoder_splicing(decoder_input, batch_index, *categorical_input)
 
         # Expression Decoder
         if not self.use_size_factor_key:
@@ -771,7 +781,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         py_["r"] = py_r
 
         return {
-            "p": p,
+            "p": p_s,
             "px_scale": px_scale,
             "px_r": torch.exp(self.px_r),
             "px_rate": px_rate,
@@ -784,23 +794,24 @@ class MULTIVAESPLICE(BaseModuleClass):
         """Computes the loss function for the model."""
         # Get the data
         x = tensors[REGISTRY_KEYS.X_KEY]
+        atse_counts = tensors['atse_counts_key'][:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)]
+        junc_counts = tensors['junc_counts_key'][:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)]
 
         # TODO: CHECK IF THIS FAILS IN ONLY RNA DATA
         x_rna = x[:, : self.n_input_genes]
-        x_chr = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_regions)]
+        x_junc = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)]
         if self.n_input_proteins == 0:
             y = torch.zeros(x.shape[0], 1, device=x.device, requires_grad=False)
         else:
             y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
 
         mask_expr = x_rna.sum(dim=1) > 0
-        mask_acc = x_chr.sum(dim=1) > 0
+        mask_spl = x_junc.sum(dim=1) > 0
         mask_pro = y.sum(dim=1) > 0
 
-        # Compute Accessibility loss
+        # Compute Splicing loss
         p = generative_outputs["p"]
-        libsize_acc = inference_outputs["libsize_acc"]
-        rl_accessibility = self.get_reconstruction_loss_accessibility(x_chr, p, libsize_acc)
+        rl_splicing= self.get_reconstruction_loss_splicing(x_junc, atse_counts, junc_counts, p) 
 
         # Compute Expression loss
         px_rate = generative_outputs["px_rate"]
@@ -821,9 +832,9 @@ class MULTIVAESPLICE(BaseModuleClass):
         # calling without weights makes this act like a masked sum
         # TODO : CHECK MIXING HERE
         recon_loss_expression = rl_expression * mask_expr
-        recon_loss_accessibility = rl_accessibility * mask_acc
+        recon_loss_splicing = rl_splicing * mask_spl
         recon_loss_protein = rl_protein * mask_pro
-        recon_loss = recon_loss_expression + recon_loss_accessibility + recon_loss_protein
+        recon_loss = recon_loss_expression + recon_loss_splicing + recon_loss_protein
 
         # Compute KLD between Z and N(0,I)
         qz_m = inference_outputs["qz_m"]
@@ -839,7 +850,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             (inference_outputs["qzm_acc"], inference_outputs["qzv_acc"]),
             (inference_outputs["qzm_pro"], inference_outputs["qzv_pro"]),
             mask_expr,
-            mask_acc,
+            mask_spl,
             mask_pro,
         )
 
@@ -852,7 +863,7 @@ class MULTIVAESPLICE(BaseModuleClass):
 
         recon_losses = {
             "reconstruction_loss_expression": recon_loss_expression,
-            "reconstruction_loss_accessibility": recon_loss_accessibility,
+            "reconstruction_loss_accessibility": recon_loss_splicing,
             "reconstruction_loss_protein": recon_loss_protein,
         }
         kl_local = {
@@ -860,6 +871,12 @@ class MULTIVAESPLICE(BaseModuleClass):
             "kl_divergence_paired": kl_div_paired,
         }
         return LossOutput(loss=loss, reconstruction_loss=recon_losses, kl_local=kl_local)
+    
+    def get_reconstruction_loss_splicing(self, x, atse_counts, junc_counts, p):
+        log_logits_eps = torch.logaddexp(torch.zeros_like(p), p) 
+        log_likelihood = (junc_counts * p) - (atse_counts * log_logits_eps) #get the log likelihood
+        reconstruction_loss = -log_likelihood.mean() #binomial loss
+        return reconstruction_loss
 
     def get_reconstruction_loss_expression(self, x, px_rate, px_r, px_dropout):
         """Computes the reconstruction loss for the expression data."""
@@ -880,6 +897,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         """Computes the reconstruction loss for the accessibility data."""
         reg_factor = torch.sigmoid(self.region_factors) if self.region_factors is not None else 1
         return torch.nn.BCELoss(reduction="none")(p * d * reg_factor, (x > 0).float()).sum(dim=-1)
+
 
     def _compute_mod_penalty(self, mod_params1, mod_params2, mod_params3, mask1, mask2, mask3):
         """Computes Similarity Penalty across modalities given selection (None, Jeffreys, MMD).
