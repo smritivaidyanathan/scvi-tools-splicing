@@ -207,8 +207,9 @@ class DecoderSplice(torch.nn.Module):
         )
     def forward(self, z: torch.Tensor, *cat_list: int):
         """Forward pass."""
-        ps = self.py_back_decoder(z, *cat_list)
-        return ps
+        ps = self.ps_decoder(z, *cat_list)
+
+        return torch.nn.functional.sigmoid(ps)
 
 
 class MULTIVAESPLICE(BaseModuleClass):
@@ -428,12 +429,12 @@ class MULTIVAESPLICE(BaseModuleClass):
         # splicing
         # splicing encoder
         if self.n_input_junctions == 0:
-            input_acc = 1
+            input_spl = 1
         else:
-            input_acc = self.n_input_junctions
-        n_input_encoder_acc = input_acc + n_continuous_cov * encode_covariates
+            input_spl = self.n_input_junctions
+        n_input_encoder_spl = input_spl + n_continuous_cov * encode_covariates
         self.z_encoder_splicing = Encoder(
-            n_input=n_input_encoder_acc,
+            n_input=n_input_encoder_spl,
             n_layers=self.n_layers_encoder,
             n_output=self.n_latent,
             n_hidden=self.n_hidden,
@@ -593,7 +594,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             x_junc = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)]
 
         mask_expr = x_rna.sum(dim=1) > 0
-        mask_spl = x_junc.sum(dim=1) > 0
+        mask_spl = x_junc.sum(dim=1) != 0
         mask_pro = y.sum(dim=1) > 0
 
         if cont_covs is not None and self.encode_covariates:
@@ -614,6 +615,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         qzm_spl, qzv_spl, z_spl = self.z_encoder_splicing(
             encoder_input_splicing, batch_index, *categorical_input
         )
+
         qzm_expr, qzv_expr, z_expr = self.z_encoder_expression(
             encoder_input_expression, batch_index, *categorical_input
         )
@@ -641,6 +643,10 @@ class MULTIVAESPLICE(BaseModuleClass):
             weights,
             torch.sqrt,
         )
+
+        qz_v = torch.clamp(qz_v, min=1e-6)
+
+
 
         # sample
         if n_samples > 1:
@@ -847,7 +853,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         # Compute KLD between distributions for paired data
         kl_div_paired = self._compute_mod_penalty(
             (inference_outputs["qzm_expr"], inference_outputs["qzv_expr"]),
-            (inference_outputs["qzm_acc"], inference_outputs["qzv_acc"]),
+            (inference_outputs["qzm_spl"], inference_outputs["qzv_spl"]),
             (inference_outputs["qzm_pro"], inference_outputs["qzv_pro"]),
             mask_expr,
             mask_spl,
@@ -863,7 +869,7 @@ class MULTIVAESPLICE(BaseModuleClass):
 
         recon_losses = {
             "reconstruction_loss_expression": recon_loss_expression,
-            "reconstruction_loss_accessibility": recon_loss_splicing,
+            "reconstruction_loss_splicing": recon_loss_splicing,
             "reconstruction_loss_protein": recon_loss_protein,
         }
         kl_local = {
@@ -873,9 +879,16 @@ class MULTIVAESPLICE(BaseModuleClass):
         return LossOutput(loss=loss, reconstruction_loss=recon_losses, kl_local=kl_local)
     
     def get_reconstruction_loss_splicing(self, x, atse_counts, junc_counts, p):
-        log_logits_eps = torch.logaddexp(torch.zeros_like(p), p) 
-        log_likelihood = (junc_counts * p) - (atse_counts * log_logits_eps) #get the log likelihood
-        reconstruction_loss = -log_likelihood.mean() #binomial loss
+        log_probabilities = torch.log(p + 1e-10)  # Add epsilon to avoid log(0)
+        log_complement_probabilities = torch.log(1 - p + 1e-10)  # Avoid log(0)
+        
+        # Log-likelihood calculation
+        log_likelihood = (
+            junc_counts * log_probabilities +
+            (atse_counts - junc_counts) * log_complement_probabilities
+        )
+        reconstruction_loss = -log_likelihood.mean()  # Negative log-likelihood as loss
+    
         return reconstruction_loss
 
     def get_reconstruction_loss_expression(self, x, px_rate, px_r, px_dropout):

@@ -76,7 +76,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         * ``"None"``: No penalty
     n_hidden
         Number of nodes per hidden layer. If `None`, defaults to square root
-        of number of regions.
+        of number of junctions.
     n_latent
         Dimensionality of the latent space. If `None`, defaults to square root
         of `n_hidden`.
@@ -126,8 +126,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
     -----
     * The model assumes that the features are organized so that all expression features are
        consecutive, followed by all accessibility features. For example, if the data has 100 genes
-       and 250 genomic regions, the model assumes that the first 100 features are genes, and the
-       next 250 are the regions.
+       and 250 genomic junctions, the model assumes that the first 100 features are genes, and the
+       next 250 are the junctions.
 
     * The main batch annotation, specified in ``setup_anndata``, should correspond to
        the modality each cell originated from. This allows the model to focus mixing efforts, using
@@ -180,7 +180,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
 
         self.module = self._module_cls(
             n_input_genes=n_genes,
-            n_input_regions=n_junctions,
+            n_input_junctions=n_junctions,
             n_input_proteins=n_proteins,
             modality_weights=modality_weights,
             modality_penalty=modality_penalty,
