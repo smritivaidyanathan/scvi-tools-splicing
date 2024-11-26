@@ -409,7 +409,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
     def get_latent_representation(
         self,
         adata: AnnData | None = None,
-        modality: Literal["joint", "expression", "accessibility"] = "joint",
+        modality: Literal["joint", "expression", "splicing"] = "joint",
         indices: Sequence[int] | None = None,
         give_mean: bool = True,
         batch_size: int | None = None,
@@ -444,13 +444,13 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         if not self.fully_paired and modality != "joint":
             if modality == "expression":
                 keys = {"z": "z_expr", "qz_m": "qzm_expr", "qz_v": "qzv_expr"}
-            elif modality == "accessibility":
-                keys = {"z": "z_acc", "qz_m": "qzm_acc", "qz_v": "qzv_acc"}
+            elif modality == "splicing":
+                keys = {"z": "z_spl", "qz_m": "qzm_spl", "qz_v": "qzv_spl"}
             elif modality == "protein":
                 keys = {"z": "z_pro", "qz_m": "qzm_pro", "qz_v": "qzv_pro"}
             else:
                 raise RuntimeError(
-                    "modality must be 'joint', 'expression', 'accessibility', or 'protein'."
+                    "modality must be 'joint', 'expression', 'splicing', or 'protein'."
                 )
 
         adata = self._validate_anndata(adata)
