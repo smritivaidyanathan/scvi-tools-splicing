@@ -474,6 +474,117 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
 
             latent += [z.cpu()]
         return torch.cat(latent).numpy()
+    
+    @torch.inference_mode()
+    def get_splicing_estimates(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] = None,
+        n_samples_overall: int | None = None,
+        junction_list: Sequence[str] | None = None,
+        transform_batch: str | int | None = None,
+        use_z_mean: bool = True,
+        threshold: float | None = None,
+        normalize_cells: bool = False,
+        normalize_junctions: bool = False,
+        batch_size: int = 128,
+        return_numpy: bool = False,
+    ) -> np.ndarray | csr_matrix | pd.DataFrame:
+        """Impute the full junction usage matrix.
+
+        Returns a matrix of splicing junction usage ratios for each cell and genomic region in the
+        input (for return matrix A, A[i,j] is the probability that junction j is used in cell
+        i).
+
+        Parameters
+        ----------
+        adata
+            AnnData object that has been registered with scvi. If `None`, defaults to the
+            AnnData object used to initialize the model.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        n_samples_overall
+            Number of samples to return in total
+        junction_list
+            Junctions to use. if `None`, all junctions are used.
+        transform_batch
+            Batch to condition on.
+            If transform_batch is:
+
+            - None, then real observed batch is used
+            - int, then batch transform_batch is used
+        use_z_mean
+            If True (default), use the distribution mean. Otherwise, sample from the distribution.
+        threshold
+            If provided, values below the threshold are replaced with 0 and a sparse matrix
+            is returned instead. This is recommended for very large matrices. Must be between 0 and
+            1.
+        normalize_cells
+            Whether to reintroduce library size factors to scale the normalized probabilities.
+            This makes the estimates closer to the input, but removes the library size correction.
+            False by default.
+        normalize_junctions
+            Whether to reintroduce region factors to scale the normalized probabilities. This makes
+            the estimates closer to the input, but removes the region-level bias correction. False
+            by default.
+        batch_size
+            Minibatch size for data loading into model
+        """
+        self._check_adata_modality_weights(adata)
+        adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata, required=True)
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        if n_samples_overall is not None:
+            indices = np.random.choice(indices, n_samples_overall)
+        post = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+        transform_batch = _get_batch_code_from_category(adata_manager, transform_batch)
+
+        if junction_list is None:
+            junction_mask = slice(None)
+        else:
+            junction_mask = [region in junction_list for region in adata.var_names[self.n_genes :]]
+
+        if threshold is not None and (threshold < 0 or threshold > 1):
+            raise ValueError("the provided threshold must be between 0 and 1")
+
+        imputed = []
+        for tensors in post:
+            get_generative_input_kwargs = {"transform_batch": transform_batch[0]}
+            generative_kwargs = {"use_z_mean": use_z_mean}
+            inference_outputs, generative_outputs = self.module.forward(
+                tensors=tensors,
+                get_generative_input_kwargs=get_generative_input_kwargs,
+                generative_kwargs=generative_kwargs,
+                compute_loss=False,
+            )
+            p = generative_outputs["p"].cpu()
+            if threshold:
+                p[p < threshold] = 0
+                p = csr_matrix(p.numpy())
+            if junction_mask is not None:
+                p = p[:, junction_mask]
+            imputed.append(p)
+
+        if threshold:  # imputed is a list of csr_matrix objects
+            imputed = vstack(imputed, format="csr")
+        else:  # imputed is a list of tensors
+            imputed = torch.cat(imputed).numpy()
+
+        if return_numpy:
+            return imputed
+        elif threshold:
+            return pd.DataFrame.sparse.from_spmatrix(
+                imputed,
+                index=adata.obs_names[indices],
+                columns=adata.var_names[self.n_genes :][junction_mask],
+            )
+        else:
+            return pd.DataFrame(
+                imputed,
+                index=adata.obs_names[indices],
+                columns=adata.var_names[self.n_genes :][junction_mask],
+            )
 
     @torch.inference_mode()
     def get_accessibility_estimates(

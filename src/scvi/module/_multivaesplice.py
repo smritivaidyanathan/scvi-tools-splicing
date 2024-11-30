@@ -594,7 +594,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             x_junc = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)]
 
         mask_expr = x_rna.sum(dim=1) > 0
-        mask_spl = x_junc.sum(dim=1) != 0
+        mask_spl = x_junc.sum(dim=1) > -100000000000000
         mask_pro = y.sum(dim=1) > 0
 
         if cont_covs is not None and self.encode_covariates:
