@@ -213,12 +213,12 @@ class DecoderSplice(torch.nn.Module):
 
 
 class MULTIVAESPLICE(BaseModuleClass):
-    """Variational auto-encoder model for joint paired + unpaired RNA-seq and ATAC-seq data.
+    """Variational auto-encoder model for joint paired + unpaired RNA-seq and alternative splicing data.
 
     Parameters
     ----------
     n_input_junctions
-        Number of input regions.
+        Number of input junctions.
     n_input_genes
         Number of input genes.
     n_input_proteins
@@ -594,7 +594,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             x_junc = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)]
 
         mask_expr = x_rna.sum(dim=1) > 0
-        mask_spl = x_junc.sum(dim=1) > -100000000000000
+        mask_spl = x_junc.sum(dim=1) > -100000000000000 #making sure none of the splicing junctions get removed. 
         mask_pro = y.sum(dim=1) > 0
 
         if cont_covs is not None and self.encode_covariates:
