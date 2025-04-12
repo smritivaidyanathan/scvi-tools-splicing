@@ -12,8 +12,11 @@ from . import data, model, external, utils
 
 from importlib.metadata import version
 
-package_name = "scvi-tools"
-__version__ = version(package_name)
+try:
+    from importlib.metadata import version
+    __version__ = version("scvi-tools")
+except Exception:
+    __version__ = "custom"
 
 settings.verbosity = logging.INFO
 

@@ -4,6 +4,7 @@ from typing import NamedTuple
 class _REGISTRY_KEYS_NT(NamedTuple):
     X_KEY: str = "X"
     ATAC_X_KEY: str = "atac"
+    JUNC_RATIO_X_KEY: str = "junc_ratio"
     BATCH_KEY: str = "batch"
     SAMPLE_KEY: str = "sample"
     LABELS_KEY: str = "labels"

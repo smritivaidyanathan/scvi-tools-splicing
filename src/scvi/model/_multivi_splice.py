@@ -855,7 +855,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             # Register the primary splicing data as X from the specified junc_ratio_layer.
             mudata_fields.append(
                 fields.MuDataLayerField(
-                    REGISTRY_KEYS.X_KEY,
+                    REGISTRY_KEYS.JUNC_RATIO_X_KEY,
                     junc_ratio_layer,  # e.g. "junc_ratio"
                     mod_key=modalities.junc_ratio_layer,
                     is_count_data=True,

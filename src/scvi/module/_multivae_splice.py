@@ -396,7 +396,10 @@ class MULTIVAESPLICE(BaseModuleClass):
     ############################################################################
     def _get_inference_input(self, tensors):
         """Assemble inputs for the inference network from registered fields."""
-        x = tensors[REGISTRY_KEYS.X_KEY]
+        x = tensors.get(REGISTRY_KEYS.X_KEY, None)
+        x_junc = tensors.get(REGISTRY_KEYS.JUNC_RATIO_X_KEY, None)
+        if x is not None and x_junc is not None:
+            x = torch.cat((x, x_junc), dim=-1)
         batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
         cell_idx = tensors.get(REGISTRY_KEYS.INDICES_KEY).long().ravel()
         cont_covs = tensors.get(REGISTRY_KEYS.CONT_COVS_KEY)
@@ -445,8 +448,8 @@ class MULTIVAESPLICE(BaseModuleClass):
         else:
             weights = self.mod_weights.unsqueeze(0).expand(len(cell_idx), -1)
 
-        qz_m = self._mix_modalities((qzm_expr, qzm_spl), (mask_expr, mask_spl), weights)
-        qz_v = self._mix_modalities((qzv_expr, qzv_spl), (mask_expr, mask_spl), weights, torch.sqrt)
+        qz_m = mix_modalities((qzm_expr, qzm_spl), (mask_expr, mask_spl), weights)
+        qz_v = mix_modalities((qzv_expr, qzv_spl), (mask_expr, mask_spl), weights, torch.sqrt)
         qz_v = torch.clamp(qz_v, min=1e-6)
 
         untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
@@ -572,7 +575,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         if self.modality_penalty == "None":
             return 0
         elif self.modality_penalty == "Jeffreys":
-            penalty = self._sym_kld(mod_params_expr[0], mod_params_expr[1].sqrt(),
+            penalty = sym_kld(mod_params_expr[0], mod_params_expr[1].sqrt(),
                                     mod_params_spl[0], mod_params_spl[1].sqrt())
             return penalty[mask].sum()
         elif self.modality_penalty == "MMD":
@@ -580,9 +583,6 @@ class MULTIVAESPLICE(BaseModuleClass):
             return penalty[mask].sum()
         else:
             raise ValueError("modality penalty not supported")
-
-    _sym_kld = staticmethod(lambda qzm1, qzv1, qzm2, qzv2: kld(Normal(qzm1, qzv1.sqrt()), Normal(qzm2, qzv2.sqrt())) +
-                                               kld(Normal(qzm2, qzv2.sqrt()), Normal(qzm1, qzv1.sqrt())))
 
     def loss(self, tensors, inference_outputs, generative_outputs, kl_weight: float = 1.0):
         """
@@ -634,5 +634,46 @@ class MULTIVAESPLICE(BaseModuleClass):
         }
         kl_local = {"kl_divergence_z": kl_div_z, "kl_divergence_paired": kl_div_paired}
         return LossOutput(loss=total_loss, reconstruction_loss=recon_losses, kl_local=kl_local)
+
+
+@auto_move_data
+def mix_modalities(Xs, masks, weights, weight_transform: callable = None):
+    """Compute the weighted mean of the Xs while masking unmeasured modality values.
+
+    Parameters
+    ----------
+    Xs
+        Sequence of Xs to mix, each should be (N x D)
+    masks
+        Sequence of masks corresponding to the Xs, indicating whether the values
+        should be included in the mix or not (N)
+    weights
+        Weights for each modality (either K or N x K)
+    weight_transform
+        Transformation to apply to the weights before using them
+    """
+    # (batch_size x latent) -> (batch_size x modalities x latent)
+    Xs = torch.stack(Xs, dim=1)
+    # (batch_size) -> (batch_size x modalities)
+    masks = torch.stack(masks, dim=1).float()
+    weights = masked_softmax(weights, masks, dim=-1)
+
+    # (batch_size x modalities) -> (batch_size x modalities x latent)
+    weights = weights.unsqueeze(-1)
+    if weight_transform is not None:
+        weights = weight_transform(weights)
+
+    # sum over modalities, so output is (batch_size x latent)
+    return (weights * Xs).sum(1)
+
+
+@auto_move_data
+def sym_kld(qzm1, qzv1, qzm2, qzv2):
+    """Symmetric KL divergence between two Gaussians."""
+    rv1 = Normal(qzm1, qzv1.sqrt())
+    rv2 = Normal(qzm2, qzv2.sqrt())
+
+    return kld(rv1, rv2) + kld(rv2, rv1)
+
 
 
