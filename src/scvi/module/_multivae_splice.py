@@ -95,7 +95,7 @@ class DecoderSplice(torch.nn.Module):
 ###############################################################################
 
 class MULTIVAESPLICE(BaseModuleClass):
-    r"""Variational auto-encoder for joint paired and unpaired RNA-seq and alternative splicing data.
+    """Variational auto-encoder for joint paired and unpaired RNA-seq and alternative splicing data.
 
     This module is an adaptation of MultiVAE. integrates gene expression and alternative splicing (junction usage ratios)
     by means of two separate encoder-decoder branches that are fused into a joint latent space.
@@ -372,7 +372,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         Parameters
         ----------
         x : Tensor
-            Input tensor for splicing (unused, kept for compatibility).
+            Input tensor for splicing with junc_ratio (unused, kept for compatibility).
         atse_counts : Tensor
             Total counts per event.
         junc_counts : Tensor

@@ -34,7 +34,7 @@ from scvi.model.base import (
     VAEMixin,
 )
 from scvi.model.base._de_core import _de_core
-from scvi.module import MULTIVISPLICE
+from scvi.module import MULTIVAESPLICE
 from scvi.train import AdversarialTrainingPlan
 from scvi.train._callbacks import SaveBestState
 from scvi.utils import track
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin):
-    r"""Integration of gene expression and alternative splicing signals.
+    """Integration of gene expression and alternative splicing signals.
 
     MULTIVISPLICE is designed to integrate multiomic data that includes gene
     expression and alternative splicing measurements (e.g. junction usage ratios).
@@ -109,7 +109,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
     * This model integrates only gene expression and splicing data.  
     * The splicing modality does not use library size factors.
     """
-    _module_cls = MULTIVISPLICE
+    _module_cls = MULTIVAESPLICE
     _training_plan_cls = AdversarialTrainingPlan
 
     def __init__(
@@ -493,8 +493,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             return imputed
         else:
             if isinstance(adata, MuData):
-                # For MuData, assume splicing features come from the "junc_counts" modality.
-                col_names = adata["junc_counts"].var_names
+                # For MuData, assume splicing features come from the "junc_ratio" modality.
+                col_names = adata["junc_ratio"].var_names
             else:
                 col_names = adata.var_names[self.n_genes : self.n_genes + self.n_junctions]
             if threshold:
@@ -708,7 +708,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         cls,
         adata: AnnData,
         layer: str | None = None,
-        junc_counts: str | None = None,
+        junc_ratio: str | None = None,
         cell_by_junction_matrix: str | None = None,
         cell_by_cluster_matrix: str | None = None,
         batch_key: str | None = None,
@@ -723,8 +723,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         ----------
         %(param_adata)s
         %(param_layer)s
-        junc_counts
-            Key in ``adata.layers`` for raw junction counts.
+        junc_ratio
+            Key in ``adata.layers`` for junction ratio values.
         cell_by_junction_matrix
             Key in ``adata.layers`` for the cell-by-junction matrix.
         cell_by_cluster_matrix
@@ -752,8 +752,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             NumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys),
             NumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),
         ]
-        if junc_counts is not None:
-            anndata_fields.append(LayerField("junc_counts_key", junc_counts, is_count_data=True))
+        if junc_ratio is not None:
+            anndata_fields.append(LayerField("junc_ratio_key", junc_ratio, is_count_data=True))
         if cell_by_junction_matrix is not None:
             anndata_fields.append(LayerField("cell_by_junction_matrix", cell_by_junction_matrix, is_count_data=True))
         if cell_by_cluster_matrix is not None:
@@ -768,9 +768,9 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         cls,
         mdata: MuData,
         rna_layer: str | None = None,
-        junc_counts: str | None = None,
-        cell_by_junction_matrix: str | None = None,
-        cell_by_cluster_matrix: str | None = None,
+        junc_ratio_layer: str | None = None,
+        atse_counts_layer: str | None = None,
+        junc_counts_layer: str | None = None,
         batch_key: str | None = None,
         size_factor_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
@@ -785,16 +785,20 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         ----------
         %(param_mdata)s
         rna_layer
-            Key in the MuData object for RNA counts.
-        junc_counts
-            Key in the MuData object for raw junction counts.
-        cell_by_junction_matrix
-            Key in the MuData object for the cell-by-junction matrix.
-        cell_by_cluster_matrix
-            Key in the MuData object for the cell-by-cluster splicing matrix.
+            Key in the RNA AnnData for gene expression counts.
+            If `None`, the primary data (`.X`) of that AnnData is used.
+        junc_ratio_layer
+            Key in the splicing AnnData for junction ratio values.
+            If `None`, the primary data (`.X`) of that AnnData is used.
+        atse_counts_layer
+            Key in the splicing AnnData for total event counts.
+            If `None`, defaults to `"cell_by_cluster_matrix"`.
+        junc_counts_layer
+            Key in the splicing AnnData for observed junction counts.
+            If `None`, defaults to `"cell_by_junction_matrix"`.
         %(param_batch_key)s
         size_factor_key
-            Key in ``mdata.obsm`` for size factors (used for gene expression).
+            Key in `mdata.obsm` for size factors.
         %(param_cat_cov_keys)s
         %(param_cont_cov_keys)s
         %(idx_layer)s
@@ -802,21 +806,19 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
 
         Examples
         --------
-        >>> mdata = muon.read_10x_h5("filtered_feature_bc_matrix.h5")
+        >>> mdata = mu.MuData({
+        ...    "rna": ge_anndata.copy(),
+        ...    "splicing": atse_anndata.copy()
+        ... })
         >>> scvi.model.MULTIVISPLICE.setup_mudata(
         ...     mdata,
-        ...     modalities={
-        ...         "rna_layer": "rna",
-        ...         "junc_counts": "junc_counts",
-        ...         "cell_by_junction_matrix": "cell_by_junction_matrix",
-        ...         "cell_by_cluster_matrix": "cell_by_cluster_matrix"
-        ...     },
-        ...     batch_key="batch"
+        ...     modalities={"rna_layer": "rna", "junc_ratio_layer": "splicing"},
+        ...     rna_layer="raw_counts",            # gene expression data is in the GE AnnData's "raw_counts" layer
+        ...     junc_ratio_layer="junc_ratio",     # splicing data is in the ATSE AnnData's "junc_ratio" layer
         ... )
         >>> model = scvi.model.MULTIVISPLICE(mdata)
         """
         setup_method_args = cls._get_setup_method_args(**locals())
-
         if modalities is None:
             raise ValueError("Modalities cannot be None.")
         modalities = cls._create_modalities_attr_dict(modalities, setup_method_args)
@@ -829,77 +831,65 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         )
         mudata_fields = [
             batch_field,
-            fields.MuDataCategoricalObsField(
-                REGISTRY_KEYS.LABELS_KEY,
-                None,
-                mod_key=None,
-            ),
-            fields.MuDataNumericalJointObsField(
-                REGISTRY_KEYS.SIZE_FACTOR_KEY,
-                size_factor_key,
-                mod_key=None,
-                required=False,
-            ),
-            fields.MuDataCategoricalJointObsField(
-                REGISTRY_KEYS.CAT_COVS_KEY,
-                categorical_covariate_keys,
-                mod_key=modalities.categorical_covariate_keys,
-            ),
-            fields.MuDataNumericalJointObsField(
-                REGISTRY_KEYS.CONT_COVS_KEY,
-                continuous_covariate_keys,
-                mod_key=modalities.continuous_covariate_keys,
-            ),
-            fields.MuDataNumericalObsField(
-                REGISTRY_KEYS.INDICES_KEY,
-                "_indices",
-                mod_key=modalities.idx_layer,
-                required=False,
-            ),
+            fields.MuDataCategoricalObsField(REGISTRY_KEYS.LABELS_KEY, None, mod_key=None),
+            fields.MuDataNumericalJointObsField(REGISTRY_KEYS.SIZE_FACTOR_KEY, size_factor_key, mod_key=None, required=False),
+            fields.MuDataCategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys, mod_key=modalities.categorical_covariate_keys),
+            fields.MuDataNumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys, mod_key=modalities.continuous_covariate_keys),
+            fields.MuDataNumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices", mod_key=modalities.idx_layer, required=False),
         ]
+
+        # RNA modality registration: use rna_layer from the GE AnnData.
         if modalities.rna_layer is not None:
             mudata_fields.append(
                 fields.MuDataLayerField(
                     REGISTRY_KEYS.X_KEY,
-                    rna_layer,
+                    rna_layer,  # e.g. "raw_counts"
                     mod_key=modalities.rna_layer,
                     is_count_data=True,
                     mod_required=True,
                 )
             )
-        if modalities.junc_counts is not None:
+
+        # Splicing modality registration: we expect the ATSE AnnData to hold the relevant splicing layers.
+        if modalities.junc_ratio_layer is not None:
+            # Register the primary splicing data as X from the specified junc_ratio_layer.
             mudata_fields.append(
                 fields.MuDataLayerField(
-                    "junc_counts_key",
-                    junc_counts,
-                    mod_key=modalities.junc_counts,
+                    REGISTRY_KEYS.X_KEY,
+                    junc_ratio_layer,  # e.g. "junc_ratio"
+                    mod_key=modalities.junc_ratio_layer,
                     is_count_data=True,
                     mod_required=True,
                 )
             )
-        if modalities.cell_by_junction_matrix is not None:
+            # Register the additional splicing layers.
+            if atse_counts_layer is None:
+                atse_counts_layer = "cell_by_cluster_matrix"
             mudata_fields.append(
                 fields.MuDataLayerField(
-                    "cell_by_junction_matrix",
-                    cell_by_junction_matrix,
-                    mod_key=modalities.cell_by_junction_matrix,
+                    "atse_counts_key",  # internal key used by the model
+                    atse_counts_layer,
+                    mod_key=modalities.junc_ratio_layer,
                     is_count_data=True,
                     mod_required=True,
                 )
             )
-        if modalities.cell_by_cluster_matrix is not None:
+            if junc_counts_layer is None:
+                junc_counts_layer = "cell_by_junction_matrix"
             mudata_fields.append(
                 fields.MuDataLayerField(
-                    "cell_by_cluster_matrix",
-                    cell_by_cluster_matrix,
-                    mod_key=modalities.cell_by_cluster_matrix,
+                    "junc_counts_key",  # internal key used by the model
+                    junc_counts_layer,
+                    mod_key=modalities.junc_ratio_layer,
                     is_count_data=True,
                     mod_required=True,
                 )
             )
+
         adata_manager = AnnDataManager(fields=mudata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(mdata, **kwargs)
         cls.register_manager(adata_manager)
+
 
     def _check_adata_modality_weights(self, adata):
         r"""Checks whether held-out data is provided when using per-cell weights.

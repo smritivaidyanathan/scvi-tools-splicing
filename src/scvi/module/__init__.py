@@ -4,6 +4,7 @@ from ._classifier import Classifier
 from ._jaxvae import JaxVAE
 from ._mrdeconv import MRDeconv
 from ._multivae import MULTIVAE
+from ._multivae_splice import MULTIVAESPLICE
 from ._peakvae import PEAKVAE
 from ._scanvae import SCANVAE
 from ._totalvae import TOTALVAE
@@ -21,6 +22,7 @@ __all__ = [
     "VAEC",
     "MRDeconv",
     "MULTIVAE",
+    "MULTIVAESPLICE",
     "AmortizedLDAPyroModule",
     "JaxVAE",
 ]
