@@ -16,10 +16,6 @@ from scvi.nn import DecoderSCVI, Encoder, FCLayers
 from ._utils import masked_softmax
 
 
-###############################################################################
-# Module-level Auxiliary Classes
-###############################################################################
-
 class LibrarySizeEncoder(torch.nn.Module):
     """Library size encoder for gene expression.
 
@@ -89,10 +85,6 @@ class DecoderSplice(torch.nn.Module):
         ps = self.ps_decoder(z, *cat_list)
         return torch.sigmoid(ps)
 
-
-###############################################################################
-# Main Module Class: MULTIVAESPLICE
-###############################################################################
 
 class MULTIVAESPLICE(BaseModuleClass):
     """Variational auto-encoder for joint paired and unpaired RNA-seq and alternative splicing data.
@@ -317,83 +309,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         else:
             self.mod_weights = torch.nn.Parameter(torch.ones(n_obs, max_n_modalities))
 
-    ############################################################################
-    # Reconstruction Loss Methods (placed together)
-    ############################################################################
-    def get_reconstruction_loss_expression(self, x, px_rate, px_r, px_dropout):
-        """Compute the reconstruction loss for gene expression data."""
-        if self.gene_likelihood == "zinb":
-            loss_val = -ZeroInflatedNegativeBinomial(mu=px_rate, theta=px_r, zi_logits=px_dropout).log_prob(x).sum(dim=-1)
-        elif self.gene_likelihood == "nb":
-            loss_val = -NegativeBinomial(mu=px_rate, theta=px_r).log_prob(x).sum(dim=-1)
-        elif self.gene_likelihood == "poisson":
-            loss_val = -Poisson(px_rate).log_prob(x).sum(dim=-1)
-        else:
-            loss_val = 0.0
-        return loss_val
 
-    @staticmethod
-    def _get_reconstruction_loss_splicing_static(x, atse_counts, junc_counts, p, loss_type="beta_binomial", concentration=None):
-        """
-        Compute the reconstruction loss for splicing data using a binomial or beta‐binomial log‐likelihood.
-        Entries where atse_counts == 0 are ignored.
-        """
-        mask = atse_counts != 0
-        if loss_type == "binomial":
-            log_prob = torch.log(p + 1e-10)
-            log_prob_comp = torch.log(1 - p + 1e-10)
-            log_likelihood = junc_counts * log_prob + (atse_counts - junc_counts) * log_prob_comp
-            log_likelihood_masked = log_likelihood[mask]
-            return -log_likelihood_masked.mean()
-        elif loss_type == "beta_binomial":
-            if concentration is None:
-                concentration = torch.tensor(1.0, device=p.device)
-            alpha = p * concentration
-            beta = (1 - p) * concentration
-            log_pm = (torch.lgamma(atse_counts + 1)
-                      - torch.lgamma(junc_counts + 1)
-                      - torch.lgamma(atse_counts - junc_counts + 1)
-                      + torch.lgamma(junc_counts + alpha)
-                      + torch.lgamma(atse_counts - junc_counts + beta)
-                      - torch.lgamma(atse_counts + alpha + beta)
-                      - torch.lgamma(alpha)
-                      - torch.lgamma(beta)
-                      + torch.lgamma(alpha + beta))
-            log_pm_masked = log_pm[mask]
-            return -log_pm_masked.mean()
-        else:
-            raise ValueError("loss_type must be either 'binomial' or 'beta_binomial'")
-
-    def get_reconstruction_loss_splicing(self, x, atse_counts, junc_counts, p):
-        """Compute the reconstruction loss for splicing data.
-
-        Uses the instance attributes `splicing_loss_type` and `splicing_concentration`.
-
-        Parameters
-        ----------
-        x : Tensor
-            Input tensor for splicing with junc_ratio (unused, kept for compatibility).
-        atse_counts : Tensor
-            Total counts per event.
-        junc_counts : Tensor
-            Observed junction counts.
-        p : Tensor
-            Decoded splicing probabilities.
-
-        Returns
-        -------
-        Tensor
-            The negative log-likelihood loss for splicing.
-        """
-        return MULTIVAESPLICE._get_reconstruction_loss_splicing_static(
-            x, atse_counts, junc_counts, p,
-            loss_type=self.splicing_loss_type,
-            concentration=self.splicing_concentration
-        )
-
-    ############################################################################
-    # Inference and Generative Methods
-    ############################################################################
     def _get_inference_input(self, tensors):
         """Assemble inputs for the inference network from registered fields."""
         x = tensors.get(REGISTRY_KEYS.X_KEY, None)
@@ -422,10 +338,11 @@ class MULTIVAESPLICE(BaseModuleClass):
 
         Splits input x into gene expression and splicing parts, encodes each branch, and mixes their latent representations.
         """
+        # Get Data and Additional Covs
         x_expr = x[:, : self.n_input_genes]
         x_spl = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)]
         mask_expr = x_expr.sum(dim=1) > 0
-        mask_spl = x_spl.sum(dim=1) > 0
+        mask_spl = x_spl.sum(dim=1) > -10000000000000
 
         if cont_covs is not None and self.encode_covariates:
             encoder_input_expr = torch.cat((x_expr, cont_covs), dim=-1)
@@ -439,9 +356,15 @@ class MULTIVAESPLICE(BaseModuleClass):
         else:
             categorical_input = ()
 
+        # Z Encoders
+
         qzm_expr, qzv_expr, z_expr = self.z_encoder_expression(encoder_input_expr, batch_index, *categorical_input)
         qzm_spl, qzv_spl, z_spl = self.z_encoder_splicing(encoder_input_spl, batch_index, *categorical_input)
+
+        # L encoder
         libsize_expr = self.l_encoder_expression(encoder_input_expr, batch_index, *categorical_input)
+
+        # mix representations
 
         if self.modality_weights == "cell":
             weights = self.mod_weights[cell_idx, :]
@@ -452,9 +375,8 @@ class MULTIVAESPLICE(BaseModuleClass):
         qz_v = mix_modalities((qzv_expr, qzv_spl), (mask_expr, mask_spl), weights, torch.sqrt)
         qz_v = torch.clamp(qz_v, min=1e-6)
 
-        untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
-        z = self.z_encoder_expression.z_transformation(untran_z)
 
+        # sample
         if n_samples > 1:
             def unsqz(zt, n_s):
                 return zt.unsqueeze(0).expand((n_s, *zt.shape))
@@ -463,6 +385,12 @@ class MULTIVAESPLICE(BaseModuleClass):
             untran_z_spl = Normal(qzm_spl, qzv_spl.sqrt()).sample((n_samples,))
             z_spl = self.z_encoder_splicing.z_transformation(untran_z_spl)
             libsize_expr = unsqz(libsize_expr, n_samples)
+
+
+        # sample from the mixed representation
+        untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
+        z = self.z_encoder_expression.z_transformation(untran_z)
+
         return {
             "z": z,
             "qz_m": qz_m,
@@ -478,17 +406,24 @@ class MULTIVAESPLICE(BaseModuleClass):
         }
 
     def _get_generative_input(self, tensors, inference_outputs, transform_batch=None):
-        """Assemble inputs for the generative model."""
+        """Get the input for the generative model."""
         z = inference_outputs["z"]
         qz_m = inference_outputs["qz_m"]
         libsize_expr = inference_outputs["libsize_expr"]
+
         batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
-        cont_covs = tensors.get(REGISTRY_KEYS.CONT_COVS_KEY)
-        cat_covs = tensors.get(REGISTRY_KEYS.CAT_COVS_KEY)
+        cont_key = REGISTRY_KEYS.CONT_COVS_KEY
+        cont_covs = tensors[cont_key] if cont_key in tensors.keys() else None
+
+        cat_key = REGISTRY_KEYS.CAT_COVS_KEY
+        cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
+
         if transform_batch is not None:
             batch_index = torch.ones_like(batch_index) * transform_batch
+
         label = tensors[REGISTRY_KEYS.LABELS_KEY]
-        return {
+
+        input_dict = {
             "z": z,
             "qz_m": qz_m,
             "batch_index": batch_index,
@@ -497,6 +432,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             "libsize_expr": libsize_expr,
             "label": label,
         }
+        return input_dict
 
     @auto_move_data
     def generative(self, z, qz_m, batch_index, cont_covs=None, cat_covs=None, libsize_expr=None, use_z_mean=False, label: torch.Tensor = None):
@@ -516,13 +452,19 @@ class MULTIVAESPLICE(BaseModuleClass):
             categorical_input = torch.split(cat_covs, 1, dim=1)
         else:
             categorical_input = ()
+
+        latent = z if not use_z_mean else qz_m
         if cont_covs is None:
-            decoder_input = z
-        elif z.dim() != cont_covs.dim():
-            decoder_input = torch.cat([z, cont_covs.unsqueeze(0).expand(z.size(0), -1, -1)], dim=-1)
+            decoder_input = latent
+        elif latent.dim() != cont_covs.dim():
+            decoder_input = torch.cat(
+                [latent, cont_covs.unsqueeze(0).expand(latent.size(0), -1, -1)], dim=-1
+            )
         else:
-            decoder_input = torch.cat([z, cont_covs], dim=-1)
+            decoder_input = torch.cat([latent, cont_covs], dim=-1)
+        # Splicing Decoder
         p_s = self.z_decoder_splicing(decoder_input, batch_index, *categorical_input)
+        # Expression Decoder
         px_scale, _, px_rate, px_dropout = self.z_decoder_expression(
             self.gene_dispersion,
             decoder_input,
@@ -531,13 +473,14 @@ class MULTIVAESPLICE(BaseModuleClass):
             *categorical_input,
             label,
         )
+        # Expression Dispersion
         if self.gene_dispersion == "gene-label":
-            px_r = F.linear(F.one_hot(label.squeeze(-1), self.n_labels).float(), self.px_r)
+            px_r = F.linear(
+                F.one_hot(label.squeeze(-1), self.n_labels).float(), self.px_r
+            )  # px_r gets transposed - last dimension is nb genes
         elif self.gene_dispersion == "gene-batch":
             px_r = F.linear(F.one_hot(batch_index.squeeze(-1), self.n_batch).float(), self.px_r)
         elif self.gene_dispersion == "gene":
-            px_r = self.px_r
-        else:
             px_r = self.px_r
         px_r = torch.exp(px_r)
         return {
@@ -548,9 +491,159 @@ class MULTIVAESPLICE(BaseModuleClass):
             "px_dropout": px_dropout,
         }
 
-    ############################################################################
-    # Modality Alignment and Loss Methods
-    ############################################################################
+    def loss(self, tensors, inference_outputs, generative_outputs, kl_weight: float = 1.0):
+        """
+        Compute the total loss combining gene expression and splicing reconstruction losses,
+        latent KL divergence, and the modality alignment penalty.
+
+        For splicing, if count data is provided (via the keys "atse_counts_key" and "junc_counts_key"),
+        the loss is computed using the specified binomial or beta-binomial likelihood; otherwise, binary
+        cross-entropy is used.
+
+        Returns
+        -------
+        LossOutput
+            A container with total loss, reconstruction losses, and KL divergence details.
+        """
+        # Get the data
+        x = inference_outputs["x"]
+
+        # Split x into gene expression and splicing components
+        x_expr = x[:, :self.n_input_genes]
+        x_spl = x[:, self.n_input_genes:(self.n_input_genes + self.n_input_junctions)]
+
+        # Retrieve splicing count data if available
+        total_counts = tensors.get("atse_counts_key", None)
+        junction_counts = tensors.get("junc_counts_key", None)
+
+        # Create masks for the modality alignment penalty
+        mask_expr = x_expr.sum(dim=1) > 0
+        mask_spl = x_spl.sum(dim=1) > -10000000
+
+        # Compute Expression loss
+        px_rate = generative_outputs["px_rate"]
+        px_r = generative_outputs["px_r"]
+        px_dropout = generative_outputs["px_dropout"]
+        x_expression = x[:, : self.n_input_genes]
+        rl_expression = self.get_reconstruction_loss_expression(
+            x_expression, px_rate, px_r, px_dropout
+        )
+        
+        # Compute splicing reconstruction loss
+        if total_counts is not None and junction_counts is not None:
+            rl_splicing = self.get_reconstruction_loss_splicing(
+            x_spl,
+            total_counts,
+            junction_counts,
+            generative_outputs["p"]
+        )
+        else:
+            rl_splicing = torch.nn.BCELoss(reduction="none")(
+                generative_outputs["p"], (x_spl > 0).float()
+            ).sum(dim=-1)
+        
+        # Combine both reconstruction losses
+        recon_loss_expression = rl_expression * mask_expr
+        recon_loss_splicing = rl_splicing
+        recon_loss = recon_loss_expression + recon_loss_splicing
+
+        # Compute KL divergence between approximate posterior and prior
+        qz_m = inference_outputs["qz_m"]
+        qz_v = inference_outputs["qz_v"]
+        kl_div_z = kld(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
+
+
+        # Compute the KL divergence for paired data, passing in the precomputed masks
+        kl_div_paired = self._compute_mod_penalty(
+            (inference_outputs["qzm_expr"], inference_outputs["qzv_expr"]),
+            (inference_outputs["qzm_spl"], inference_outputs["qzv_spl"]),
+            mask_expr,
+            mask_spl
+        )
+
+        # KL WARMUP
+        kl_local_for_warmup = kl_div_z
+        weighted_kl_local = kl_weight * kl_local_for_warmup + kl_div_paired
+
+        # TOTAL LOSS
+        loss = torch.mean(recon_loss + weighted_kl_local)
+
+        recon_losses = {
+            "reconstruction_loss_expression": recon_loss_expression,
+            "reconstruction_loss_splicing": recon_loss_splicing,
+        }
+
+        kl_local = {
+            "kl_divergence_z": kl_div_z,
+            "kl_divergence_paired": kl_div_paired,
+        }
+        return LossOutput(loss=loss, reconstruction_loss=recon_losses, kl_local=kl_local)
+
+
+    def get_reconstruction_loss_expression(self, x, px_rate, px_r, px_dropout):
+        """Compute the reconstruction loss for gene expression data."""
+        if self.gene_likelihood == "zinb":
+            loss_val = -ZeroInflatedNegativeBinomial(mu=px_rate, theta=px_r, zi_logits=px_dropout).log_prob(x).sum(dim=-1)
+        elif self.gene_likelihood == "nb":
+            loss_val = -NegativeBinomial(mu=px_rate, theta=px_r).log_prob(x).sum(dim=-1)
+        elif self.gene_likelihood == "poisson":
+            loss_val = -Poisson(px_rate).log_prob(x).sum(dim=-1)
+        else:
+            loss_val = 0.0
+        return loss_val
+
+    def get_reconstruction_loss_splicing(self, x, atse_counts, junc_counts, p):
+        """
+        Compute the reconstruction loss for splicing data using a binomial or beta‐binomial log‐likelihood.
+        Entries where atse_counts == 0 are ignored.
+
+        Uses the instance attributes `splicing_loss_type` and `splicing_concentration`.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input tensor for splicing (unused, kept for compatibility).
+        atse_counts : Tensor
+            Total counts per event.
+        junc_counts : Tensor
+            Observed junction counts.
+        p : Tensor
+            Decoded splicing probabilities.
+
+        Returns
+        -------
+        Tensor
+            The negative log-likelihood loss for splicing.
+        """
+        mask = atse_counts != 0
+        if self.splicing_loss_type == "binomial":
+            log_prob = torch.log(p + 1e-10)
+            log_prob_comp = torch.log(1 - p + 1e-10)
+            log_likelihood = junc_counts * log_prob + (atse_counts - junc_counts) * log_prob_comp
+            log_likelihood_masked = log_likelihood[mask]
+            return -log_likelihood_masked.mean()
+        elif self.splicing_loss_type == "beta_binomial":
+            concentration = self.splicing_concentration
+            if concentration is None:
+                concentration = torch.tensor(1.0, device=p.device)
+            alpha = p * concentration
+            beta = (1 - p) * concentration
+            log_pm = (torch.lgamma(atse_counts + 1)
+                    - torch.lgamma(junc_counts + 1)
+                    - torch.lgamma(atse_counts - junc_counts + 1)
+                    + torch.lgamma(junc_counts + alpha)
+                    + torch.lgamma(atse_counts - junc_counts + beta)
+                    - torch.lgamma(atse_counts + alpha + beta)
+                    - torch.lgamma(alpha)
+                    - torch.lgamma(beta)
+                    + torch.lgamma(alpha + beta))
+            log_pm_masked = log_pm[mask]
+            return -log_pm_masked.mean()
+        else:
+            raise ValueError("splicing_loss_type must be either 'binomial' or 'beta_binomial'")
+
+
+
     def _compute_mod_penalty(self, mod_params_expr, mod_params_spl, mask1, mask2):
         """
         Compute the alignment penalty between expression and splicing latent distributions.
@@ -584,56 +677,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         else:
             raise ValueError("modality penalty not supported")
 
-    def loss(self, tensors, inference_outputs, generative_outputs, kl_weight: float = 1.0):
-        """
-        Compute the total loss combining gene expression and splicing reconstruction losses,
-        latent KL divergence, and the modality alignment penalty.
 
-        For splicing, if count data is provided (via the keys "atse_counts_key" and "junc_counts_key"),
-        the loss is computed using the specified binomial or beta-binomial likelihood; otherwise, binary
-        cross-entropy is used.
-
-        Returns
-        -------
-        LossOutput
-            A container with total loss, reconstruction losses, and KL divergence details.
-        """
-        x = inference_outputs["x"]
-        x_expr = x[:, : self.n_input_genes]
-        x_spl = x[:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)]
-        total_counts = tensors.get("atse_counts_key", None)
-        junction_counts = tensors.get("junc_counts_key", None)
-
-        rl_expression = self.get_reconstruction_loss_expression(x_expr, generative_outputs["px_rate"], generative_outputs["px_r"], generative_outputs["px_dropout"])
-        if total_counts is not None and junction_counts is not None:
-            rl_splicing = self.get_reconstruction_loss_splicing(
-                x_spl,
-                total_counts[:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)],
-                junction_counts[:, self.n_input_genes : (self.n_input_genes + self.n_input_junctions)],
-                generative_outputs["p"]
-            )
-        else:
-            rl_splicing = torch.nn.BCELoss(reduction="none")(generative_outputs["p"], (x_spl > 0).float()).sum(dim=-1)
-        recon_loss = rl_expression + rl_splicing
-
-        qz_m = inference_outputs["qz_m"]
-        qz_v = inference_outputs["qz_v"]
-        kl_div_z = kld(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
-
-        kl_div_paired = self._compute_mod_penalty(
-            (inference_outputs["qzm_expr"], inference_outputs["qzv_expr"]),
-            (inference_outputs["qzm_spl"], inference_outputs["qzv_spl"]),
-            mask1=(x_expr.sum(dim=1) > 0),
-            mask2=(x_spl.sum(dim=1) > 0)
-        )
-        weighted_kl = kl_weight * kl_div_z + kl_div_paired
-        total_loss = torch.mean(recon_loss + weighted_kl)
-        recon_losses = {
-            "reconstruction_loss_expression": rl_expression,
-            "reconstruction_loss_splicing": rl_splicing,
-        }
-        kl_local = {"kl_divergence_z": kl_div_z, "kl_divergence_paired": kl_div_paired}
-        return LossOutput(loss=total_loss, reconstruction_loss=recon_losses, kl_local=kl_local)
 
 
 @auto_move_data
