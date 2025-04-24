@@ -179,6 +179,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             encode_covariates=encode_covariates,
             **model_kwargs,
         )
+
         self._model_summary_string = (
             f"MultiVI Splice Model with the following params: \nn_genes: {n_genes}, "
             f"n_junctions: {n_junctions}, n_hidden: {self.module.n_hidden}, "
@@ -399,50 +400,60 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         return torch.cat(latent).numpy()
 
     @torch.inference_mode()
-    def get_normalized_splicing(
+    def get_normalized_expression(
         self,
         adata: AnnOrMuData | None = None,
-        indices: Sequence[int] = None,
+        indices: Sequence[int] | None = None,
         n_samples_overall: int | None = None,
-        junction_list: Sequence[str] | None = None,
-        transform_batch: str | int | None = None,
+        transform_batch: Sequence[Number | str] | None = None,
+        gene_list: Sequence[str] | None = None,
         use_z_mean: bool = True,
-        threshold: float | None = None,
-        normalize_junctions: bool = False,
-        batch_size: int = 128,
+        n_samples: int = 1,
+        batch_size: int | None = None,
+        return_mean: bool = True,
         return_numpy: bool = False,
-    ) -> np.ndarray | csr_matrix | pd.DataFrame:
-        r"""Impute the splicing (junction usage) matrix.
+        silent: bool = True,
+    ) -> np.ndarray | pd.DataFrame:
+        r"""Returns the normalized (decoded) gene expression.
 
-        Returns a matrix where element [i,j] represents the estimated usage ratio for junction j in cell i.
+        This is denoted as :math:`\rho_n` in the scVI paper.
 
         Parameters
         ----------
         adata
-            AnnOrMuData object registered with scvi.
+            AnnOrMuData object with equivalent structure to initial AnnData. If `None`, defaults
+            to the AnnOrMuData object used to initialize the model.
         indices
-            Indices of cells to use (default: all cells).
+            Indices of cells in adata to use. If `None`, all cells are used.
         n_samples_overall
-            If specified, randomly sample this many cells.
-        junction_list
-            List of junction names to use. If None, all junctions are used.
+            Number of observations to sample from ``indices`` if ``indices`` is provided.
         transform_batch
             Batch to condition on.
+            If transform_batch is:
+
+            - None, then real observed batch is used.
+            - int, then batch transform_batch is used.
+        gene_list
+            Return frequencies of expression for a subset of genes.
+            This can save memory when working with large datasets and few genes are
+            of interest.
         use_z_mean
-            Whether to use the mean of the latent variable.
-        threshold
-            If provided (between 0 and 1), values below the threshold are set to 0 and a sparse
-            matrix is returned.
-        normalize_junctions
-            Whether to apply junction-specific normalization if such factors exist.
+            If True, use the mean of the latent distribution, otherwise sample from it
+        n_samples
+            Number of posterior samples to use for estimation.
         batch_size
-            Batch size for data loading.
+            Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
+        return_mean
+            Whether to return the mean of the samples.
         return_numpy
-            If True, return a NumPy array; otherwise return a pandas DataFrame.
+            Return a numpy array instead of a pandas DataFrame.
+        %(de_silent)s
 
         Returns
         -------
-        A NumPy array, a scipy sparse matrix, or a pandas DataFrame with splicing estimates.
+        If `n_samples` > 1 and `return_mean` is False, then the shape is `(samples, cells, genes)`.
+        Otherwise, shape is `(cells, genes)`. In this case, return type is
+        :class:`~pandas.DataFrame` unless `return_numpy` is True.
         """
         self._check_adata_modality_weights(adata)
         adata = self._validate_anndata(adata)
@@ -451,56 +462,174 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             indices = np.arange(adata.n_obs)
         if n_samples_overall is not None:
             indices = np.random.choice(indices, n_samples_overall)
-        post = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
         transform_batch = _get_batch_code_from_category(adata_manager, transform_batch)
 
+        if gene_list is None:
+            gene_mask = slice(None)
+        else:
+            all_genes = adata.var_names[: self.n_genes]
+            gene_mask = [gene in gene_list for gene in all_genes]
+
+        exprs = []
+        for tensors in scdl:
+            per_batch_exprs = []
+            for batch in track(transform_batch, disable=silent):
+                if batch is not None:
+                    batch_indices = tensors[REGISTRY_KEYS.BATCH_KEY]
+                    tensors[REGISTRY_KEYS.BATCH_KEY] = torch.ones_like(batch_indices) * batch
+                _, generative_outputs = self.module.forward(
+                    tensors=tensors,
+                    inference_kwargs={"n_samples": n_samples},
+                    generative_kwargs={"use_z_mean": use_z_mean},
+                    compute_loss=False,
+                )
+                output = generative_outputs["px_scale"]
+                output = output[..., gene_mask]
+                output = output.cpu().numpy()
+                per_batch_exprs.append(output)
+            per_batch_exprs = np.stack(
+                per_batch_exprs
+            )  # shape is (len(transform_batch) x batch_size x n_var)
+            exprs += [per_batch_exprs.mean(0)]
+
+        if n_samples > 1:
+            # The -2 axis correspond to cells.
+            exprs = np.concatenate(exprs, axis=-2)
+        else:
+            exprs = np.concatenate(exprs, axis=0)
+        if n_samples > 1 and return_mean:
+            exprs = exprs.mean(0)
+
+        if return_numpy:
+            return exprs
+        else:
+            return pd.DataFrame(
+                exprs,
+                columns=adata.var_names[: self.n_genes][gene_mask],
+                index=adata.obs_names[indices],
+            )
+
+    @torch.inference_mode()
+    def get_normalized_splicing(
+        self,
+        adata: AnnOrMuData | None = None,
+        indices: Sequence[int] | None = None,
+        n_samples_overall: int | None = None,
+        transform_batch: Sequence[Number | str] | None = None,
+        junction_list: Sequence[str] | None = None,
+        use_z_mean: bool = True,
+        n_samples: int = 1,
+        batch_size: int | None = None,
+        return_mean: bool = True,
+        return_numpy: bool = False,
+        silent: bool = True,
+    ) -> np.ndarray | pd.DataFrame:
+        r"""Returns the normalized (decoded) splicing probabilities.
+
+        This is denoted as :math:`p_{nj}` in the MULTIVISPLICE model.
+
+        Parameters
+        ----------
+        adata
+            AnnOrMuData object with the same structure as used in setup. If `None`,
+            defaults to the AnnOrMuData object used to initialize the model.
+        indices
+            Cell indices to use. If `None`, all cells are used.
+        n_samples_overall
+            Number of observations to sample from `indices` if provided.
+        transform_batch
+            Batch(s) to condition on:
+            - None: use true observed batch
+            - int: force all cells to that batch
+            - list[int|str]: average over those batches
+        junction_list
+            Subset of junction names to return. If `None`, returns all junctions.
+        use_z_mean
+            If True, use the mean of the latent distribution; otherwise sample.
+        n_samples
+            Number of posterior samples to draw. If >1 and `return_mean` is True,
+            the result is averaged over draws.
+        batch_size
+            Minibatch size for decoding. Defaults to `scvi.settings.batch_size`.
+        return_mean
+            Whether to average over posterior samples when `n_samples>1`.
+        return_numpy
+            If True, returns a NumPy array; otherwise a pandas DataFrame.
+        silent
+            If True, suppresses the progress bar.
+
+        Returns
+        -------
+        A NumPy array or pandas DataFrame of shape `(cells, junctions)` containing the
+        decoded splicing probabilities.
+        """
+        # Validate and prepare
+        self._check_adata_modality_weights(adata)
+        adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata, required=True)
+
+        # Select cells
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        if n_samples_overall is not None:
+            indices = np.random.choice(indices, size=n_samples_overall, replace=False)
+
+        # Data loader
+        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
+        # Batches to transform over
+        transform_batch = _get_batch_code_from_category(adata_manager, transform_batch)
+
+        # Build junction mask
+        all_junc = adata.var_names[self.n_genes : self.n_genes + self.n_junctions]
         if junction_list is None:
             junction_mask = slice(None)
         else:
-            # For AnnData, assume splicing features are concatenated after gene expression.
-            junction_mask = [junc in junction_list for junc in adata.var_names[self.n_genes : self.n_genes + self.n_junctions]]
+            junction_mask = [j in junction_list for j in all_junc]
 
-        if threshold is not None and (threshold < 0 or threshold > 1):
-            raise ValueError("The provided threshold must be between 0 and 1")
+        # Decode in mini-batches
+        spls = []
+        for tensors in scdl:
+            per_batch_spls = []
+            for batch in track(transform_batch, disable=silent):
+                if batch is not None:
+                    # override batch
+                    bidx = tensors[REGISTRY_KEYS.BATCH_KEY]
+                    tensors[REGISTRY_KEYS.BATCH_KEY] = torch.ones_like(bidx) * batch
+                _, generative_outputs = self.module.forward(
+                    tensors=tensors,
+                    inference_kwargs={"n_samples": n_samples},
+                    generative_kwargs={"use_z_mean": use_z_mean},
+                    compute_loss=False,
+                )
+                output = generative_outputs["p"]
+                output = output[..., junction_mask]
+                output = output.cpu().numpy()
+                per_batch_spls.append(output)
+            per_batch_spls = np.stack(per_batch_spls)  # (len(transform_batch), bs, n_junc)
+            spls += [per_batch_spls.mean(0)]
 
-        imputed = []
-        for tensors in post:
-            gen_kwargs = {"transform_batch": transform_batch[0]}
-            generative_kwargs = {"use_z_mean": use_z_mean}
-            inference_outputs, generative_outputs = self.module.forward(
-                tensors=tensors,
-                get_generative_input_kwargs=gen_kwargs,
-                generative_kwargs=generative_kwargs,
-                compute_loss=False,
-            )
-            p = generative_outputs["p"].cpu()
+        # Concatenate across minibatches
+        spls = np.concatenate(spls, axis=0)  # (n_cells, n_selected_junc)
 
-            if normalize_junctions:
-                if hasattr(self.module, "junction_factors") and self.module.junction_factors is not None:
-                    p *= torch.sigmoid(self.module.junction_factors).cpu()
-            if threshold:
-                p[p < threshold] = 0
-                p = csr_matrix(p.numpy())
-            p = p[:, junction_mask]
-            imputed.append(p)
-
-        if threshold:
-            imputed = vstack(imputed, format="csr")
-        else:
-            imputed = torch.cat(imputed).numpy()
+        # If multiple samples requested and we averaged over them in forward
+        if n_samples > 1 and return_mean:
+            spls = spls.mean(0)
 
         if return_numpy:
-            return imputed
-        else:
-            if isinstance(adata, MuData):
-                # For MuData, assume splicing features come from the "junc_ratio" modality.
-                col_names = adata["junc_ratio"].var_names
-            else:
-                col_names = adata.var_names[self.n_genes : self.n_genes + self.n_junctions]
-            if threshold:
-                return pd.DataFrame.sparse.from_spmatrix(imputed, index=adata.obs_names[indices], columns=col_names)
-            else:
-                return pd.DataFrame(imputed, index=adata.obs_names[indices], columns=col_names)
+            return spls
+
+        # Build DataFrame
+        cols = (
+            all_junc
+            if junction_list is None
+            else [j for j, keep in zip(all_junc, junction_mask) if keep]
+        )
+        return pd.DataFrame(spls, index=adata.obs_names[indices], columns=cols)
+
+
 
     @de_dsp.dedent
     def differential_splicing(
