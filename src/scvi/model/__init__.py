@@ -11,6 +11,7 @@ from ._peakvi import PEAKVI
 from ._scanvi import SCANVI
 from ._scvi import SCVI
 from ._totalvi import TOTALVI
+from ._splicevi import SPLICEVI
 from ._utils import get_max_epochs_heuristic
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "MULTIVI",
     "MULTIVISPLICE",
     "AmortizedLDA",
+    "SPLICEVI",
     "utils",
     "JaxSCVI",
 ]

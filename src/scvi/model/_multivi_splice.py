@@ -961,7 +961,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         mudata_fields = [
             batch_field,
             fields.MuDataCategoricalObsField(REGISTRY_KEYS.LABELS_KEY, None, mod_key=None),
-            fields.MuDataNumericalJointObsField(REGISTRY_KEYS.SIZE_FACTOR_KEY, size_factor_key, mod_key=None, required=False),
+            fields.MuDataObsmField(REGISTRY_KEYS.SIZE_FACTOR_KEY, attr_key="X_library_size",is_count_data=False),
             fields.MuDataCategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys, mod_key=modalities.categorical_covariate_keys),
             fields.MuDataNumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys, mod_key=modalities.continuous_covariate_keys),
             fields.MuDataNumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices", mod_key=modalities.idx_layer, required=False),

@@ -362,7 +362,12 @@ class MULTIVAESPLICE(BaseModuleClass):
         qzm_spl, qzv_spl, z_spl = self.z_encoder_splicing(encoder_input_spl, batch_index, *categorical_input)
 
         # L encoder
-        libsize_expr = self.l_encoder_expression(encoder_input_expr, batch_index, *categorical_input)
+        if self.use_size_factor_key:
+            libsize_expr = torch.log(size_factor[:, [0]] + 1e-6)
+        else:
+            libsize_expr = self.l_encoder_expression(
+                encoder_input_expr, batch_index, *categorical_input
+            )
 
         # mix representations
 
