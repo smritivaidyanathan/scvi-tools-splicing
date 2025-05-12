@@ -125,7 +125,7 @@ def beta_binomial_loss_function(
     log_lik = beta_binomial_log_pmf(
         k=junction_counts, n=cluster_counts, alpha=alpha, beta=beta
     )
-    log_lik = log_lik * (float(n) / float(k))
+    log_lik = log_lik #* (float(n) / float(k))
     return -log_lik.mean()
 
 
@@ -381,81 +381,156 @@ class PARTIALVAE(BaseModuleClass):
 
     def _get_inference_input(
         self,
-        tensors: Dict[str, torch.Tensor | None],
+        tensors: dict[str, torch.Tensor],
         full_forward_pass: bool = False,
-    ) -> Dict[str, torch.Tensor | None]:
+    ) -> dict[str, torch.Tensor]:
+        # only x and mask
         return {
-            MODULE_KEYS.X_KEY: tensors[REGISTRY_KEYS.X_KEY],          # “x”
-            MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],  # “batch_index”
-            "mask": tensors.get(REGISTRY_KEYS.PSI_MASK_KEY, None),     # your optional mask
+            MODULE_KEYS.X_KEY: tensors[REGISTRY_KEYS.X_KEY],      # your input ratios
+            "mask": tensors.get(REGISTRY_KEYS.PSI_MASK_KEY, None),
         }
 
     def _get_generative_input(
         self,
-        tensors: Dict[str, torch.Tensor | None],
-        inference_outputs: Dict[str, torch.Tensor | Distribution | None],
-    ) -> Dict[str, torch.Tensor | None]:
-        return {
-            MODULE_KEYS.Z_KEY: inference_outputs[MODULE_KEYS.Z_KEY],   # “z”
-            MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],  # “batch_index”
-        }
-
+        tensors: dict[str, torch.Tensor],
+        inference_outputs: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        # only z needed
+        return {MODULE_KEYS.Z_KEY: inference_outputs["z"]}
 
     @auto_move_data
     def inference(
         self,
         x: torch.Tensor,
-        batch_index: torch.Tensor,
         mask: torch.Tensor | None = None,
         n_samples: int = 1,
-    ) -> dict[str, torch.Tensor | Normal]:
+    ) -> dict[str, torch.Tensor]:
+        # 1) encode to mu, raw_logvar
         mu, raw_logvar = self.encoder(x, mask)
-        logvar = torch.clamp(raw_logvar, min=-10.0, max=20.0)
+        # 2) clamp logvar then build Normal
+        logvar = torch.clamp(raw_logvar, min=-10.0, max=10.0)
         qz = Normal(mu, torch.exp(0.5 * logvar))
-        z = qz.rsample() if n_samples == 1 else qz.sample((n_samples,))
-        return {MODULE_KEYS.Z_KEY: z, MODULE_KEYS.QZ_KEY: qz}
+        # 3) sample / rsample
+        if n_samples == 1:
+            z = qz.rsample()
+        else:
+            z = qz.sample((n_samples,))
+        # 4) return z, posterior params
+        return {"z": z, "qz_m": mu, "qz_v": torch.exp(logvar)}
     
     @auto_move_data
     def generative(
         self,
         z: torch.Tensor,
-        batch_index: torch.Tensor | None = None,
-    ) -> dict[str, Distribution]:
-        logits = self.decoder(z)
-        px = Bernoulli(logits=logits)
-        pz = Normal(torch.zeros_like(z), torch.ones_like(z))
-        return {MODULE_KEYS.PX_KEY: px, MODULE_KEYS.PZ_KEY: pz}
+    ) -> dict[str, torch.Tensor]:
+        # decode to logits → p
+        reconstruction = self.decoder(z)
+        return {"reconstruction": reconstruction}
+
 
     def loss(
         self,
-        tensors: Dict[str, torch.Tensor],
-        inference_outputs: Dict[str, torch.Tensor | Distribution],
-        generative_outputs: Dict[str, Distribution],
+        tensors: dict[str, torch.Tensor],
+        inference_outputs: dict[str, torch.Tensor],
+        generative_outputs: dict[str, torch.Tensor],
         kl_weight: float | torch.Tensor = 1.0,
     ) -> LossOutput:
-        x = tensors[REGISTRY_KEYS.X_KEY]
-        mask = tensors.get(REGISTRY_KEYS.PSI_MASK_KEY, None)
-        junc = tensors["junction_counts"]
-        clus = tensors["cluster_counts"]
+        # 1) unpack data
+        x = tensors[REGISTRY_KEYS.X_KEY]                      # (B, D) input ratios (unused here)
+        mask = tensors.get(REGISTRY_KEYS.PSI_MASK_KEY, None)  # (B, D) binary
+        junc = tensors["junction_counts"]                     # (B, D) successes
+        clus = tensors["cluster_counts"]                      # (B, D) trials
 
-        qz = inference_outputs[MODULE_KEYS.QZ_KEY]
-        px = generative_outputs[MODULE_KEYS.PX_KEY]
+        # 2) reconstruction
+        p = generative_outputs["reconstruction"]  # (B, D) Bernoulli probabilities
+        if self.splice_likelihood == "binomial":
+            reconst = binomial_loss_function(
+                logits=p,
+                junction_counts=junc,
+                cluster_counts=clus,
+                n=x.numel(),
+                k=x.shape[0],
+                mask=mask,
+            )
+        else:
+            concentration = torch.exp(self.log_concentration)
+            reconst = beta_binomial_loss_function(
+                logits=p,
+                junction_counts=junc,
+                cluster_counts=clus,
+                n=x.numel(),
+                k=x.shape[0],
+                concentration=concentration,
+                mask=mask,
+            )
+        # reconst is a scalar: -E_q [ log p(x|z) ]
 
-        # reconstruction
-        n, k = x.numel(), x.shape[0]
-        reconst = (
-            binomial_loss_function(px.logits, junc, clus, n, k, mask)
-            if self.splice_likelihood == "binomial"
-            else beta_binomial_loss_function(px.logits, junc, clus, n, k, torch.exp(self.log_concentration), mask)
+        # 3) KL divergence
+        mu = inference_outputs["qz_m"]   # (B, Z)
+        var = inference_outputs["qz_v"]  # (B, Z) = σ²
+        sigma = torch.sqrt(var)          # (B, Z)
+        qz = Normal(mu, sigma)
+        pz = Normal(torch.zeros_like(mu), torch.ones_like(sigma))
+        kl_local = kl_divergence(qz, pz).sum(dim=1)  # (B,) sum over latent dims
+
+        # 4) total ELBO
+        #    average KL over batch, add to reconst
+        total = reconst + kl_weight * kl_local.mean()
+
+        # 5) wrap in LossOutput
+        return LossOutput(
+            loss=total,
+            reconstruction_loss=reconst,
+            kl_local=kl_local,
+            n_obs_minibatch=x.shape[0],
         )
-        # KL
-        mu, logvar = qz.loc, 2 * torch.log(qz.scale)
-        kl_z = kl_divergence(Normal(mu, torch.exp(0.5 * logvar)), Normal(0, 1)).sum(dim=1)
 
-        total = (reconst + kl_weight * kl_z).mean()
-        return LossOutput(loss=total, reconstruction_loss=reconst, kl_local=kl_z, n_obs_minibatch=x.shape[0])
+
+    # def loss(
+    #     self,
+    #     tensors: Dict[str, torch.Tensor],
+    #     inference_outputs: Dict[str, torch.Tensor | Distribution],
+    #     generative_outputs: Dict[str, Distribution],
+    #     kl_weight: float | torch.Tensor = 1.0,
+    # ) -> LossOutput:
+    #     x = tensors[REGISTRY_KEYS.X_KEY]
+    #     mask = tensors.get(REGISTRY_KEYS.PSI_MASK_KEY, None)
+    #     junc = tensors["junction_counts"]
+    #     clus = tensors["cluster_counts"]
+
+    #     qz = inference_outputs[MODULE_KEYS.QZ_KEY]
+    #     px = generative_outputs[MODULE_KEYS.PX_KEY]
+
+    #     # reconstruction
+    #     n, k = x.numel(), x.shape[0]
+    #     reconst = (
+    #         binomial_loss_function(px.logits, junc, clus, n, k, mask)
+    #         if self.splice_likelihood == "binomial"
+    #         else beta_binomial_loss_function(px.logits, junc, clus, n, k, torch.exp(self.log_concentration), mask)
+    #     )
+    #     # KL
+    #     mu, raw_logvar = qz.loc, 2 * torch.log(qz.scale)  # raw_logvar = unclamped 2*log(sigma)
+    #     logvar_clamped = torch.clamp(raw_logvar, min=-10.0, max=10.0)
+    #     std_clamped = torch.exp(0.5 * logvar_clamped)
+    #     qz_clamped = Normal(mu, std_clamped)
+    #     pz = Normal(torch.zeros_like(mu), torch.ones_like(mu))
+
+    #     kl_div = kl_divergence(qz_clamped, pz)
+    #     if kl_div.ndim > 1:
+    #         kl_div = kl_div.sum(dim=1)  # sum over latent dims
+
+    #     # Note: batch‐mean happens after adding reconstruction
+    #     total = (reconst + kl_weight * kl_div).mean()
+
+    #     return LossOutput(
+    #         loss=total,
+    #         reconstruction_loss=reconst,
+    #         kl_local=kl_div,
+    #         n_obs_minibatch=x.shape[0],
+    #     )
+
 
     @torch.inference_mode()
     def sample(self, tensors: Dict[str, torch.Tensor], n_samples: int = 1) -> torch.Tensor:
         _, gen_out = self.forward(tensors, compute_loss=False)
-        return gen_out[MODULE_KEYS.PX_KEY].sample().cpu()
+        return gen_out["reconstruction"].cpu() 

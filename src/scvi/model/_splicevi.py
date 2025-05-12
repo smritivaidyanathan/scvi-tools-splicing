@@ -133,6 +133,11 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         check_val_every_n_epoch: int | None = None,
         n_steps_kl_warmup: int | None = None,
         n_epochs_kl_warmup: int | None = 50,
+        reduce_lr_on_plateau: bool = False,
+        lr_factor: float = 0.6,
+        lr_patience: int = 30,
+        lr_threshold: float = 0.0,
+        lr_min: float = 0.0,
         datasplitter_kwargs: dict | None = None,
         plan_kwargs: dict | None = None,
         **kwargs,
@@ -172,6 +177,11 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             "n_epochs_kl_warmup": n_epochs_kl_warmup,
             "n_steps_kl_warmup": n_steps_kl_warmup,
             "optimizer": "AdamW",
+            "reduce_lr_on_plateau": reduce_lr_on_plateau,
+            "lr_factor": lr_factor,
+            "lr_patience": lr_patience,
+            "lr_threshold": lr_threshold,
+            "lr_min": lr_min,
         }
         if plan_kwargs is not None:
             plan_kwargs.update(update_dict)
@@ -325,9 +335,9 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         for tensors in scdl:
             inf_inputs = self.module._get_inference_input(tensors)
             outputs = self.module.inference(**inf_inputs)
-            qz = outputs["qz"]  # Underlying Normal distribution
+            qz_m = outputs["qz_m"]  # Underlying Normal distribution
             z = outputs["z"]
             if give_mean:
-                z = qz.loc
+                z = qz_m
             latents.append(z.cpu())
         return torch.cat(latents).numpy()
