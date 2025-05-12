@@ -171,7 +171,6 @@ class MULTIVAESPLICE(BaseModuleClass):
         n_continuous_cov: int = 0,
         n_cats_per_cov: Iterable[int] | None = None,
         dropout_rate: float = 0.1,
-        region_factors: bool = True,
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         latent_distribution: Literal["normal", "ln"] = "normal",

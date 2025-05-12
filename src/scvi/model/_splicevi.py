@@ -25,7 +25,7 @@ from scvi.module import PARTIALVAE
 from scvi.utils import setup_anndata_dsp
 
 from scvi.train import TrainRunner, TrainingPlan
-from scvi.utils import devices_dsp
+from scvi.utils._docstrings import de_dsp, devices_dsp, setup_anndata_dsp
 from scvi.train._callbacks import SaveBestState
 
 from scvi.model._utils import (
@@ -70,9 +70,9 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
         latent_dim: int = 10,
-        decoder_hidden_dim: int = 64,
-        dropout_rate: float = 0.0,
+        dropout_rate: float = 0.0, #0.01
         learn_concentration: bool = True,
+        splice_likelihood: Literal["binomial", "beta_binomial"] = "beta_binomial",
         **kwargs,
     ):
         super().__init__(adata)
@@ -82,18 +82,20 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             h_hidden_dim=h_hidden_dim,
             encoder_hidden_dim=encoder_hidden_dim,
             n_latent=latent_dim,
-            decoder_hidden_dim=decoder_hidden_dim,
             dropout_rate=dropout_rate,
             learn_concentration=learn_concentration,
+            splice_likelihood = splice_likelihood,
             **kwargs,
         )
         self._model_summary_string = (
-            f"SpliceVI model with code_dim={code_dim}, h_hidden_dim={h_hidden_dim}, "
-            f"encoder_hidden_dim={encoder_hidden_dim}, latent_dim={latent_dim}, "
-            f"decoder_hidden_dim={decoder_hidden_dim}, dropout_rate={dropout_rate}, "
-            f"learn_concentration={learn_concentration}."
+            f"SpliceVI PartialVAE with "
+            f"h_hidden_dim={h_hidden_dim}, "
+            f"encoder_hidden_dim={encoder_hidden_dim}, "
+            f"latent_dim={latent_dim}, "
+            f"learn_concentration={learn_concentration}, "
+            f"splice_likelihood={splice_likelihood}."
         )
-
+        
         if self._module_init_on_train:
             self.module = None
             warnings.warn(
@@ -109,7 +111,6 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 n_batch=n_batch,
                 **self._module_kwargs,
             )
-            self.module.minified_data_type = self.minified_data_type
 
         self.init_params_ = self._get_init_params(locals())
 
@@ -118,14 +119,14 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     def train(
         self,
         max_epochs: int = 500,
-        lr: float = 1e-4,
+        lr: float = 1e-4, # 0.001
         accelerator: str = "auto",
         devices: int | list[int] | str = "auto",
         train_size: float | None = None,
         validation_size: float | None = None,
         shuffle_set_split: bool = True,
-        batch_size: int = 128,
-        weight_decay: float = 1e-3,
+        batch_size: int = 128, #bigger batch size
+        weight_decay: float = 1e-3, #remove weight decay
         eps: float = 1e-8,
         early_stopping: bool = True,
         save_best: bool = True,

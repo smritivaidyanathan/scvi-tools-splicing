@@ -154,23 +154,22 @@ class PartialEncoder(nn.Module):
         self.code_dim = code_dim
         self.latent_dim = latent_dim
 
-        # Learnable feature embedding (F_d in paper notation)
+        # Learnable feature embedding (F_d in paper notation) with Xavier/Glorot initialization
         # Shape: (D, K)
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+        nn.init.xavier_uniform_(self.feature_embedding)
 
-        # Learnable bias term per feature (b_d in paper notation)
-        # Shape: (D, 1)
-        self.feature_bias = nn.Parameter(torch.zeros(input_dim, 1))
-
-        # Shared function h(.) applied to each feature representation s_d = [x_d, F_d, b_d]
-        # Input dim: 1 (feature value) + K (embedding) + 1 (bias) = K + 2
+        # Shared function h(.) applied to each feature representation s_d = [x_d, F_d]
+        # Input dim: 1 (feature value) + K (embedding) = K + 1
         # Output dim: K (code_dim)
         self.h_layer = nn.Sequential(
-            nn.Linear(1 + code_dim + 1, h_hidden_dim),
+            nn.Linear(1 + code_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),           
             nn.ReLU(),
-            nn.Dropout(dropout_rate), # Added dropout
+            nn.Dropout(dropout_rate), 
             nn.Linear(h_hidden_dim, code_dim),
-            nn.ReLU() # ReLU after last linear is common in intermediate feature extractors
+            nn.LayerNorm(code_dim),   
+            nn.ReLU()
         )
 
         # MLP to map aggregated representation 'c' to latent distribution parameters
@@ -178,8 +177,9 @@ class PartialEncoder(nn.Module):
         # Output dim: 2 * Z (for mu and logvar)
         self.encoder_mlp = nn.Sequential(
             nn.Linear(code_dim, encoder_hidden_dim),
+            nn.LayerNorm(encoder_hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout_rate), # Added dropout
+            nn.Dropout(dropout_rate), 
             nn.Linear(encoder_hidden_dim, 2 * latent_dim) # outputs both mu and logvar
         )
 
@@ -210,73 +210,72 @@ class PartialEncoder(nn.Module):
         if x.ndim != 2 or mask.ndim != 2:
              raise ValueError(f"Input tensor and mask must be 2D (batch_size, input_dim). Got shapes {x.shape} and {mask.shape}")
 
-
         # Step 1: Reshape inputs for processing each feature independently
         # Flatten batch and feature dimensions: (B, D) -> (B*D, 1)
         x_flat = x.reshape(-1, 1)                                # Shape: (B*D, 1)
 
         # Step 2: Prepare feature embeddings and biases for each item in the flattened batch
-        F_embed = self.feature_embedding.unsqueeze(0).expand(batch_size, -1, -1).reshape(-1, self.code_dim)
-        b_embed = self.feature_bias.unsqueeze(0).expand(batch_size, -1, -1).reshape(-1, 1)
+        # Feature embeddings F_d: (D, K) -> (B*D, K) by repeating for each batch item
+
+        # Efficient expansion using broadcasting
+        F_embed = self.feature_embedding.unsqueeze(0).expand(batch_size, -1, -1).reshape(-1, self.code_dim) # Shape: (B*D, K)
 
         # Step 3: Construct input for the shared 'h' function for each feature instance
-        h_input = torch.cat([x_flat, F_embed, b_embed], dim=1)
+        # Input s_d = [x_d, F_d]
+        h_input = torch.cat([x_flat, F_embed], dim=1)  # Shape: (B*D, 1 + K + 1)
 
         # Step 4: Apply the shared h network to each feature representation s_d
-        h_out_flat = self.h_layer(h_input)
+        h_out_flat = self.h_layer(h_input)                      # Shape: (B*D, K)
 
         # Step 5: Reshape back to (batch_size, num_features, code_dim)
-        h_out = h_out_flat.view(batch_size, self.input_dim, self.code_dim)
+        h_out = h_out_flat.view(batch_size, self.input_dim, self.code_dim)  # Shape: (B, D, K)
 
         # Step 6: Apply the mask. Zero out representations of missing features.
-        mask_exp = mask.float().unsqueeze(-1)
-        h_masked = h_out * mask_exp
+        mask_float = mask.float() 
+        # Expand mask: (B, D) -> (B, D, 1) for broadcasting
+        mask_exp = mask_float.unsqueeze(-1)                           # Shape: (B, D, 1)
+        h_masked = h_out * mask_exp                             # Shape: (B, D, K)
 
-        # Step 7: Aggregate over observed features
-        c = h_masked.sum(dim=1)
+        # Step 7: Aggregate over observed features (permutation-invariant function g)
+        # Sum along the feature dimension (dim=1) --> combining Features Per Cell 
+        c = h_masked.sum(dim=1)                                 # Shape: (B, K)
 
-        # Step 8: Pass the aggregated representation 'c' through the final MLP
-        enc_out = self.encoder_mlp(c)
+        # Step 8: Pass the aggregated representation 'c' through the final MLP 
+        enc_out = self.encoder_mlp(c)                           # Shape: (B, 2*Z)
 
         # Step 9: Split the output into mean (mu) and log variance (logvar)
-        mu, logvar = enc_out.chunk(2, dim=-1)
+        mu, logvar = enc_out.chunk(2, dim=-1)                   # Shapes: (B, Z), (B, Z)
 
         return mu, logvar
 
-
-class PartialDecoder(nn.Module):
-    def __init__(self, latent_dim: int, decoder_hidden_dim: int, output_dim: int, code_dim: int, dropout_rate: float = 0.0):
+class LinearDecoder(nn.Module):
+    def __init__(self, latent_dim: int, output_dim: int):
+        """
+        Simple linear decoder that directly maps from latent space to output space.
+        
+        Parameters:
+          latent_dim (int): Dimension of latent space (Z).
+          output_dim (int): Dimension of output space (D).
+        """
         super().__init__()
         self.latent_dim = latent_dim
         self.output_dim = output_dim
-        self.code_dim = code_dim
-
-        self.z_processor = nn.Sequential(
-            nn.Linear(latent_dim, decoder_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-        )
-
-        # Input: processed_z + F_d + b_d
-        self.j_layer = nn.Sequential(
-            nn.Linear(decoder_hidden_dim + code_dim + 1, decoder_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(decoder_hidden_dim, 1) # Predict 1 value per feature
-        )
-
-    def forward(self, z: torch.Tensor, feature_embedding: nn.Parameter, feature_bias: nn.Parameter) -> torch.Tensor:
-        batch_size = z.size(0)
-        processed_z = self.z_processor(z)
-        processed_z_expanded = processed_z.unsqueeze(1).expand(-1, self.output_dim, -1)
-        F = feature_embedding.unsqueeze(0).expand(batch_size, -1, -1)
-        b = feature_bias.unsqueeze(0).expand(batch_size, -1, -1)
-
-        j_input = torch.cat([processed_z_expanded, F, b], dim=2)
-        j_out = self.j_layer(j_input.view(-1, j_input.shape[-1]))
-        reconstruction = j_out.view(batch_size, self.output_dim)
-        return reconstruction
-
+        
+        # Simple linear layer from latent space to output space
+        self.linear = nn.Linear(latent_dim, output_dim)
+    
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the decoder.
+        
+        Args:
+            z (torch.Tensor): Latent vector (batch_size, latent_dim).
+            
+        Returns:
+            torch.Tensor: Reconstructed data (batch_size, output_dim).
+        """
+        # Direct linear mapping from latent to output
+        return self.linear(z)
 
 class PARTIALVAE(BaseModuleClass):
     """
@@ -350,7 +349,6 @@ class PARTIALVAE(BaseModuleClass):
         code_dim: int = 16,
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
-        decoder_hidden_dim: int = 64,
         learn_concentration: bool = True,
     ):
         super().__init__()
@@ -376,12 +374,9 @@ class PARTIALVAE(BaseModuleClass):
             latent_dim=n_latent,
             dropout_rate=dropout_rate,
         )
-        self.decoder = PartialDecoder(
+        self.decoder = LinearDecoder(
             latent_dim=n_latent,
-            decoder_hidden_dim=decoder_hidden_dim,
             output_dim=n_input,
-            code_dim=code_dim,
-            dropout_rate=dropout_rate,
         )
 
     def _get_inference_input(
@@ -426,7 +421,7 @@ class PARTIALVAE(BaseModuleClass):
         z: torch.Tensor,
         batch_index: torch.Tensor | None = None,
     ) -> dict[str, Distribution]:
-        logits = self.decoder(z, self.encoder.feature_embedding, self.encoder.feature_bias)
+        logits = self.decoder(z)
         px = Bernoulli(logits=logits)
         pz = Normal(torch.zeros_like(z), torch.ones_like(z))
         return {MODULE_KEYS.PX_KEY: px, MODULE_KEYS.PZ_KEY: pz}
