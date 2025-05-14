@@ -22,13 +22,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-
 def binomial_loss_function(
     logits: torch.Tensor,
     junction_counts: torch.Tensor,
     cluster_counts: torch.Tensor,
-    n: int,
-    k: int,
+    n,
+    k,
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
@@ -38,9 +37,7 @@ def binomial_loss_function(
       logits: Reconstructed logits from decoder.
       junction_counts: Junction counts from data.
       cluster_counts: Cluster counts from data.
-      n: Number of samples in dataset.
-      k: Number of batches in dataloader.
-      mask: Optional mask to exclude missing values.
+      mask: Mask to exclude missing values when running partialVAE.
       
     Returns:
       total_loss: Reconstruction loss according to binomial likelihood.
@@ -58,7 +55,6 @@ def binomial_loss_function(
     log_lik = (
         junction_counts * log_p + (cluster_counts - junction_counts) * log_1_p
     )
-    log_lik = log_lik * (float(n) / float(k))
     return -log_lik.mean()
 
 
@@ -154,10 +150,8 @@ class PartialEncoder(nn.Module):
         self.code_dim = code_dim
         self.latent_dim = latent_dim
 
-        # Learnable feature embedding (F_d in paper notation) with Xavier/Glorot initialization
-        # Shape: (D, K)
-        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
-        nn.init.xavier_uniform_(self.feature_embedding)
+        # Learnable feature embedding (F_d in paper notation)
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim)) #D by K initialized via PCA 
 
         # Shared function h(.) applied to each feature representation s_d = [x_d, F_d]
         # Input dim: 1 (feature value) + K (embedding) = K + 1
@@ -346,7 +340,7 @@ class PARTIALVAE(BaseModuleClass):
         use_batch_norm: Literal["none", "encoder", "decoder", "both"] = "both",
         use_layer_norm: Literal["none", "encoder", "decoder", "both"] = "none",
         extra_payload_autotune: bool = False,
-        code_dim: int = 16,
+        code_dim: int = 32,
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
         learn_concentration: bool = True,
@@ -356,8 +350,9 @@ class PARTIALVAE(BaseModuleClass):
         # Store parameters
         self.splice_likelihood = splice_likelihood
         self.latent_distribution = latent_distribution
-        self.extra_payload_autotune = extra_payload_autotune
+        self.extra_payload_autotune = extra_payload_autotune # what's this? 
         self.learn_concentration = learn_concentration
+        self.input_dim = n_input
 
         # Concentration parameter for Beta-Binomial
         if learn_concentration:
@@ -378,6 +373,23 @@ class PARTIALVAE(BaseModuleClass):
             latent_dim=n_latent,
             output_dim=n_input,
         )
+
+    def initialize_feature_embedding_from_pca(self, pca_components: np.ndarray):
+
+        """
+        Inject PCA components into feature embedding of PartialEncoder.
+        """
+
+        if not isinstance(pca_components, np.ndarray):
+            raise TypeError("pca_components must be a numpy array.")
+    
+        assert pca_components.shape == (self.input_dim, self.encoder.code_dim), \
+            f"PCA shape {pca_components.shape} does not match model ({self.input_dim}, {self.encoder.code_dim})"
+
+        with torch.no_grad():
+            self.encoder.feature_embedding.copy_(
+                torch.tensor(pca_components, dtype=self.encoder.feature_embedding.dtype)
+            )
 
     def _get_inference_input(
         self,
@@ -484,51 +496,6 @@ class PARTIALVAE(BaseModuleClass):
             kl_local=kl_local,
             n_obs_minibatch=x.shape[0],
         )
-
-
-    # def loss(
-    #     self,
-    #     tensors: Dict[str, torch.Tensor],
-    #     inference_outputs: Dict[str, torch.Tensor | Distribution],
-    #     generative_outputs: Dict[str, Distribution],
-    #     kl_weight: float | torch.Tensor = 1.0,
-    # ) -> LossOutput:
-    #     x = tensors[REGISTRY_KEYS.X_KEY]
-    #     mask = tensors.get(REGISTRY_KEYS.PSI_MASK_KEY, None)
-    #     junc = tensors["junction_counts"]
-    #     clus = tensors["cluster_counts"]
-
-    #     qz = inference_outputs[MODULE_KEYS.QZ_KEY]
-    #     px = generative_outputs[MODULE_KEYS.PX_KEY]
-
-    #     # reconstruction
-    #     n, k = x.numel(), x.shape[0]
-    #     reconst = (
-    #         binomial_loss_function(px.logits, junc, clus, n, k, mask)
-    #         if self.splice_likelihood == "binomial"
-    #         else beta_binomial_loss_function(px.logits, junc, clus, n, k, torch.exp(self.log_concentration), mask)
-    #     )
-    #     # KL
-    #     mu, raw_logvar = qz.loc, 2 * torch.log(qz.scale)  # raw_logvar = unclamped 2*log(sigma)
-    #     logvar_clamped = torch.clamp(raw_logvar, min=-10.0, max=10.0)
-    #     std_clamped = torch.exp(0.5 * logvar_clamped)
-    #     qz_clamped = Normal(mu, std_clamped)
-    #     pz = Normal(torch.zeros_like(mu), torch.ones_like(mu))
-
-    #     kl_div = kl_divergence(qz_clamped, pz)
-    #     if kl_div.ndim > 1:
-    #         kl_div = kl_div.sum(dim=1)  # sum over latent dims
-
-    #     # Note: batch‐mean happens after adding reconstruction
-    #     total = (reconst + kl_weight * kl_div).mean()
-
-    #     return LossOutput(
-    #         loss=total,
-    #         reconstruction_loss=reconst,
-    #         kl_local=kl_div,
-    #         n_obs_minibatch=x.shape[0],
-    #     )
-
 
     @torch.inference_mode()
     def sample(self, tensors: Dict[str, torch.Tensor], n_samples: int = 1) -> torch.Tensor:
