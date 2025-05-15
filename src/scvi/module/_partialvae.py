@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Literal, Dict, Any
 
 import numpy as np
@@ -9,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal, Bernoulli, kl_divergence
 from torch.nn.functional import one_hot
+import torch.nn.functional as F
 
 from scvi import REGISTRY_KEYS, settings
 from scvi.module._constants import MODULE_KEYS
@@ -125,151 +127,317 @@ def beta_binomial_loss_function(
     return -log_lik.mean()
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Iterable
+
 class PartialEncoder(nn.Module):
-    def __init__(self, input_dim: int, h_hidden_dim: int, encoder_hidden_dim: int, 
-                 latent_dim: int, code_dim: int, dropout_rate: float = 0.0):
-        """
-        Encoder network inspired by PointNet for partially observed data.
-
-        Processes each observed feature individually using a shared network ('h_layer')
-        combined with learnable feature embeddings and biases, then aggregates
-        the results before mapping to the latent space.
-
-        Parameters:
-          input_dim (int): Dimension of input features (D). Number of junctions/features.
-          h_hidden_dim (int): Hidden dimension for the shared 'h_layer'.
-                           (Replaces the misuse of num_hidden_layers in the original h_layer definition).
-          encoder_hidden_dim (int): Hidden dimension for the final 'encoder_mlp'.
-                                 (Replaces the hardcoded 256 in the original encoder_mlp).
-          latent_dim (int): Dimension of latent space (Z).
-          code_dim (int): Dimension of feature embeddings and intermediate representations (K).
-          dropout_rate (float): Dropout rate for regularization applied within h_layer and encoder_mlp.
-        """
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+    ):
         super().__init__()
-        self.input_dim = input_dim
+        # 1) Track how many categorical and continuous covariates we have
+        #    ignore any categorical with only 1 level
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont           = n_cont
+        self.inject_covariates = inject_covariates
+        # total number of extra dims we'll append
+        total_cov = sum(self.n_cat_list) + self.n_cont
+
+        # 2) Learnable per-feature embeddings
+        #    F_d ∈ ℝ^{input_dim × code_dim}
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
         self.code_dim = code_dim
-        self.latent_dim = latent_dim
 
-        # Learnable feature embedding (F_d in paper notation)
-        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim)) #D by K initialized via PCA 
-
-        # Shared function h(.) applied to each feature representation s_d = [x_d, F_d]
-        # Input dim: 1 (feature value) + K (embedding) = K + 1
-        # Output dim: K (code_dim)
+        # 3) Shared "h" network: input = [x_d, F_d, covariates?]
+        #    - x_d is scalar → 1
+        #    - F_d is code_dim
+        #    - plus total_cov if we're injecting covariates
+        in_dim = 1 + code_dim + (total_cov if inject_covariates else 0)
         self.h_layer = nn.Sequential(
-            nn.Linear(1 + code_dim, h_hidden_dim),
-            nn.LayerNorm(h_hidden_dim),           
+            nn.Linear(in_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout_rate), 
+            nn.Dropout(dropout_rate),
             nn.Linear(h_hidden_dim, code_dim),
-            nn.LayerNorm(code_dim),   
-            nn.ReLU()
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
         )
 
-        # MLP to map aggregated representation 'c' to latent distribution parameters
-        # Input dim: K (code_dim)
-        # Output dim: 2 * Z (for mu and logvar)
+        # 4) Final MLP to get μ and log σ²: input = [c, covariates?]
+        #    where c ∈ ℝ^{code_dim} from aggregating h_out
+        mlp_in = code_dim + (total_cov if inject_covariates else 0)
         self.encoder_mlp = nn.Sequential(
-            nn.Linear(code_dim, encoder_hidden_dim),
+            nn.Linear(mlp_in, encoder_hidden_dim),
             nn.LayerNorm(encoder_hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout_rate), 
-            nn.Linear(encoder_hidden_dim, 2 * latent_dim) # outputs both mu and logvar
+            nn.Dropout(dropout_rate),
+            nn.Linear(encoder_hidden_dim, 2 * latent_dim),
         )
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass of the encoder.
+    def forward(
+        self,
+        x: torch.Tensor,                # (B, D) junction ratios
+        mask: torch.Tensor,             # (B, D) observed mask
+        *cat_list: torch.Tensor,        # e.g. batch indices shape (B,1)
+        cont: torch.Tensor | None = None,  # (B, n_cont)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, D = x.shape
 
-        Args:
-            x (torch.Tensor): Input data (batch_size, input_dim). Missing values can be anything (e.g., 0, NaN),
-                              as they will be masked out based on the 'mask' tensor.
-                              It's crucial that the *observed* values in x are the actual measurements.
-            mask (torch.Tensor): Binary mask (batch_size, input_dim). 1 indicates observed, 0 indicates missing.
-                               Must be float or long/int and compatible with multiplication.
 
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]:
-                - mu (torch.Tensor): Mean of latent distribution (batch_size, latent_dim).
-                - logvar (torch.Tensor): Log variance of latent distribution (batch_size, latent_dim).
-        """
-        batch_size = x.size(0)
+        # Debug: show batch covariate if present
+        # if self.inject_covariates and len(cat_list) > 0:
+        #     batch_idx = cat_list[0]  # by convention we pass batch first
+        #     print("▶ PartialEncoder: batch_index unique →", torch.unique(batch_idx).tolist())
+        # if self.inject_covariates and cont is not None:
+        #     print("▶ PartialEncoder: cont_covs shape →", cont.shape)
 
-        # --- Input Validation ---
-        if x.shape[1] != self.input_dim or mask.shape[1] != self.input_dim:
-             raise ValueError(f"Input tensor feature dimension ({x.shape[1]}) or mask dimension ({mask.shape[1]}) "
-                              f"does not match encoder input_dim ({self.input_dim})")
-        if x.shape != mask.shape:
-             raise ValueError(f"Input tensor shape ({x.shape}) and mask shape ({mask.shape}) must match.")
-        if x.ndim != 2 or mask.ndim != 2:
-             raise ValueError(f"Input tensor and mask must be 2D (batch_size, input_dim). Got shapes {x.shape} and {mask.shape}")
+        # --- step 1: flatten each feature to feed through h_layer ---
+        x_flat = x.reshape(-1, 1)  # (B*D, 1)
 
-        # Step 1: Reshape inputs for processing each feature independently
-        # Flatten batch and feature dimensions: (B, D) -> (B*D, 1)
-        x_flat = x.reshape(-1, 1)                                # Shape: (B*D, 1)
+        # expand feature embeddings to match the flattening
+        F_embed = (
+            self.feature_embedding
+                .unsqueeze(0)       # (1, D, code_dim)
+                .expand(B, D, -1)    # (B, D, code_dim)
+                .reshape(-1, self.feature_embedding.size(1))  # (B*D, code_dim)
+        )
 
-        # Step 2: Prepare feature embeddings and biases for each item in the flattened batch
-        # Feature embeddings F_d: (D, K) -> (B*D, K) by repeating for each batch item
+        # --- step 2: build covariate matrix (if injecting) ---
+        covs: list[torch.Tensor] = []
+        if self.inject_covariates and cont is not None:
+            # repeat each cell's continuous covariates D times
+            covs.append(cont.repeat_interleave(D, dim=0))  # (B*D, n_cont)
+        for n_cat, cat in zip(self.n_cat_list, cat_list):
+            if self.inject_covariates:
+                # one-hot encode and repeat
+                oh = F.one_hot(cat.squeeze(-1), n_cat).float()  # (B, n_cat)
+                covs.append(oh.repeat_interleave(D, dim=0))     # (B*D, n_cat)
+        cov = torch.cat(covs, dim=1) if covs else None  # (B*D, total_cov)
 
-        # Efficient expansion using broadcasting
-        F_embed = self.feature_embedding.unsqueeze(0).expand(batch_size, -1, -1).reshape(-1, self.code_dim) # Shape: (B*D, K)
+        # --- optional debug to confirm shapes ---
+        # if cov is not None:
+        #     print(f"cov shape: {cov.shape}, expected second dim = {sum(self.n_cat_list)+self.n_cont}")
 
-        # Step 3: Construct input for the shared 'h' function for each feature instance
-        # Input s_d = [x_d, F_d]
-        h_input = torch.cat([x_flat, F_embed], dim=1)  # Shape: (B*D, 1 + K + 1)
+        # --- step 3: apply shared h_layer ---
+        h_in = torch.cat([x_flat, F_embed, cov], dim=1) if cov is not None else torch.cat([x_flat, F_embed], dim=1)
+        h_out = self.h_layer(h_in).view(B, D, -1)  # (B, D, code_dim)
 
-        # Step 4: Apply the shared h network to each feature representation s_d
-        h_out_flat = self.h_layer(h_input)                      # Shape: (B*D, K)
+        # --- step 4: mask & aggregate over features ---
+        mask_exp = mask.unsqueeze(-1).float()  # (B, D, 1)
+        c = (h_out * mask_exp).sum(dim=1)       # (B, code_dim)
 
-        # Step 5: Reshape back to (batch_size, num_features, code_dim)
-        h_out = h_out_flat.view(batch_size, self.input_dim, self.code_dim)  # Shape: (B, D, K)
+        # also append one copy of the covariates for the aggregated vector
+        if cov is not None:
+            cov0 = cov.view(B, D, -1)[:, 0, :]  # (B, total_cov)
+            c = torch.cat([c, cov0], dim=1)     # (B, code_dim + total_cov)
 
-        # Step 6: Apply the mask. Zero out representations of missing features.
-        mask_float = mask.float() 
-        # Expand mask: (B, D) -> (B, D, 1) for broadcasting
-        mask_exp = mask_float.unsqueeze(-1)                           # Shape: (B, D, 1)
-        h_masked = h_out * mask_exp                             # Shape: (B, D, K)
-
-        # Step 7: Aggregate over observed features (permutation-invariant function g)
-        # Sum along the feature dimension (dim=1) --> combining Features Per Cell 
-        c = h_masked.sum(dim=1)                                 # Shape: (B, K)
-
-        # Step 8: Pass the aggregated representation 'c' through the final MLP 
-        enc_out = self.encoder_mlp(c)                           # Shape: (B, 2*Z)
-
-        # Step 9: Split the output into mean (mu) and log variance (logvar)
-        mu, logvar = enc_out.chunk(2, dim=-1)                   # Shapes: (B, Z), (B, Z)
-
+        # --- final MLP to get mu and logvar ---
+        mu_logvar = self.encoder_mlp(c)         # (B, 2*latent_dim)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
 
+
 class LinearDecoder(nn.Module):
-    def __init__(self, latent_dim: int, output_dim: int):
-        """
-        Simple linear decoder that directly maps from latent space to output space.
-        
-        Parameters:
-          latent_dim (int): Dimension of latent space (Z).
-          output_dim (int): Dimension of output space (D).
-        """
+    def __init__(
+        self,
+        latent_dim: int,
+        output_dim: int,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+    ):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.output_dim = output_dim
+        # track covariates exactly as in encoder
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont     = n_cont
+        total_cov       = sum(self.n_cat_list) + self.n_cont
+
+        # single linear layer: input = [z, covariates]
+        self.linear = nn.Linear(latent_dim + total_cov, output_dim)
+
+    def forward(
+        self,
+        z: torch.Tensor,              # (B, latent_dim)
+        *cat_list: torch.Tensor,      # each (B,1)
+        cont: torch.Tensor | None = None,  # (B, n_cont)
+    ) -> torch.Tensor:
         
-        # Simple linear layer from latent space to output space
-        self.linear = nn.Linear(latent_dim, output_dim)
+        # if self.n_cat_list:
+        #     batch_idx = cat_list[0]
+        #     print("▶ LinearDecoder: batch_index unique →", torch.unique(batch_idx).tolist())
+        # if cont is not None:
+        #     print("▶ LinearDecoder: cont_covs shape →", cont.shape)
+
+        # rebuild the same covariate concatenation
+        covs: list[torch.Tensor] = []
+        if cont is not None:
+            covs.append(cont)
+        for n_cat, cat in zip(self.n_cat_list, cat_list):
+            # one-hot encode each categorical and append
+            oh = F.one_hot(cat.squeeze(-1), n_cat).float()
+            covs.append(oh)
+        # final input to linear: (B, latent_dim + total_cov)
+        inp = torch.cat([z, *covs], dim=1) if covs else z
+        return self.linear(inp)
+
+
+
+
+# class PartialEncoder(nn.Module):
+#     def __init__(self, input_dim: int, h_hidden_dim: int, encoder_hidden_dim: int, 
+#                  latent_dim: int, code_dim: int, dropout_rate: float = 0.0):
+#         """
+#         Encoder network inspired by PointNet for partially observed data.
+
+#         Processes each observed feature individually using a shared network ('h_layer')
+#         combined with learnable feature embeddings and biases, then aggregates
+#         the results before mapping to the latent space.
+
+#         Parameters:
+#           input_dim (int): Dimension of input features (D). Number of junctions/features.
+#           h_hidden_dim (int): Hidden dimension for the shared 'h_layer'.
+#                            (Replaces the misuse of num_hidden_layers in the original h_layer definition).
+#           encoder_hidden_dim (int): Hidden dimension for the final 'encoder_mlp'.
+#                                  (Replaces the hardcoded 256 in the original encoder_mlp).
+#           latent_dim (int): Dimension of latent space (Z).
+#           code_dim (int): Dimension of feature embeddings and intermediate representations (K).
+#           dropout_rate (float): Dropout rate for regularization applied within h_layer and encoder_mlp.
+#         """
+#         super().__init__()
+#         self.input_dim = input_dim
+#         self.code_dim = code_dim
+#         self.latent_dim = latent_dim
+
+#         # Learnable feature embedding (F_d in paper notation)
+#         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim)) #D by K initialized via PCA 
+
+#         # Shared function h(.) applied to each feature representation s_d = [x_d, F_d]
+#         # Input dim: 1 (feature value) + K (embedding) = K + 1
+#         # Output dim: K (code_dim)
+#         self.h_layer = nn.Sequential(
+#             nn.Linear(1 + code_dim, h_hidden_dim),
+#             nn.LayerNorm(h_hidden_dim),           
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate), 
+#             nn.Linear(h_hidden_dim, code_dim),
+#             nn.LayerNorm(code_dim),   
+#             nn.ReLU()
+#         )
+
+#         # MLP to map aggregated representation 'c' to latent distribution parameters
+#         # Input dim: K (code_dim)
+#         # Output dim: 2 * Z (for mu and logvar)
+#         self.encoder_mlp = nn.Sequential(
+#             nn.Linear(code_dim, encoder_hidden_dim),
+#             nn.LayerNorm(encoder_hidden_dim),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate), 
+#             nn.Linear(encoder_hidden_dim, 2 * latent_dim) # outputs both mu and logvar
+#         )
+
+#     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+#         """
+#         Forward pass of the encoder.
+
+#         Args:
+#             x (torch.Tensor): Input data (batch_size, input_dim). Missing values can be anything (e.g., 0, NaN),
+#                               as they will be masked out based on the 'mask' tensor.
+#                               It's crucial that the *observed* values in x are the actual measurements.
+#             mask (torch.Tensor): Binary mask (batch_size, input_dim). 1 indicates observed, 0 indicates missing.
+#                                Must be float or long/int and compatible with multiplication.
+
+#         Returns:
+#             tuple[torch.Tensor, torch.Tensor]:
+#                 - mu (torch.Tensor): Mean of latent distribution (batch_size, latent_dim).
+#                 - logvar (torch.Tensor): Log variance of latent distribution (batch_size, latent_dim).
+#         """
+#         batch_size = x.size(0)
+
+#         # --- Input Validation ---
+#         if x.shape[1] != self.input_dim or mask.shape[1] != self.input_dim:
+#              raise ValueError(f"Input tensor feature dimension ({x.shape[1]}) or mask dimension ({mask.shape[1]}) "
+#                               f"does not match encoder input_dim ({self.input_dim})")
+#         if x.shape != mask.shape:
+#              raise ValueError(f"Input tensor shape ({x.shape}) and mask shape ({mask.shape}) must match.")
+#         if x.ndim != 2 or mask.ndim != 2:
+#              raise ValueError(f"Input tensor and mask must be 2D (batch_size, input_dim). Got shapes {x.shape} and {mask.shape}")
+
+#         # Step 1: Reshape inputs for processing each feature independently
+#         # Flatten batch and feature dimensions: (B, D) -> (B*D, 1)
+#         x_flat = x.reshape(-1, 1)                                # Shape: (B*D, 1)
+
+#         # Step 2: Prepare feature embeddings and biases for each item in the flattened batch
+#         # Feature embeddings F_d: (D, K) -> (B*D, K) by repeating for each batch item
+
+#         # Efficient expansion using broadcasting
+#         F_embed = self.feature_embedding.unsqueeze(0).expand(batch_size, -1, -1).reshape(-1, self.code_dim) # Shape: (B*D, K)
+
+#         # Step 3: Construct input for the shared 'h' function for each feature instance
+#         # Input s_d = [x_d, F_d]
+#         h_input = torch.cat([x_flat, F_embed], dim=1)  # Shape: (B*D, 1 + K + 1)
+
+#         # Step 4: Apply the shared h network to each feature representation s_d
+#         h_out_flat = self.h_layer(h_input)                      # Shape: (B*D, K)
+
+#         # Step 5: Reshape back to (batch_size, num_features, code_dim)
+#         h_out = h_out_flat.view(batch_size, self.input_dim, self.code_dim)  # Shape: (B, D, K)
+
+#         # Step 6: Apply the mask. Zero out representations of missing features.
+#         mask_float = mask.float() 
+#         # Expand mask: (B, D) -> (B, D, 1) for broadcasting
+#         mask_exp = mask_float.unsqueeze(-1)                           # Shape: (B, D, 1)
+#         h_masked = h_out * mask_exp                             # Shape: (B, D, K)
+
+#         # Step 7: Aggregate over observed features (permutation-invariant function g)
+#         # Sum along the feature dimension (dim=1) --> combining Features Per Cell 
+#         c = h_masked.sum(dim=1)                                 # Shape: (B, K)
+
+#         # Step 8: Pass the aggregated representation 'c' through the final MLP 
+#         enc_out = self.encoder_mlp(c)                           # Shape: (B, 2*Z)
+
+#         # Step 9: Split the output into mean (mu) and log variance (logvar)
+#         mu, logvar = enc_out.chunk(2, dim=-1)                   # Shapes: (B, Z), (B, Z)
+
+#         return mu, logvar
+
+# class LinearDecoder(nn.Module):
+#     def __init__(self, latent_dim: int, output_dim: int):
+#         """
+#         Simple linear decoder that directly maps from latent space to output space.
+        
+#         Parameters:
+#           latent_dim (int): Dimension of latent space (Z).
+#           output_dim (int): Dimension of output space (D).
+#         """
+#         super().__init__()
+#         self.latent_dim = latent_dim
+#         self.output_dim = output_dim
+        
+#         # Simple linear layer from latent space to output space
+#         self.linear = nn.Linear(latent_dim, output_dim)
     
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the decoder.
+#     def forward(self, z: torch.Tensor) -> torch.Tensor:
+#         """
+#         Forward pass of the decoder.
         
-        Args:
-            z (torch.Tensor): Latent vector (batch_size, latent_dim).
+#         Args:
+#             z (torch.Tensor): Latent vector (batch_size, latent_dim).
             
-        Returns:
-            torch.Tensor: Reconstructed data (batch_size, output_dim).
-        """
-        # Direct linear mapping from latent to output
-        return self.linear(z)
+#         Returns:
+#             torch.Tensor: Reconstructed data (batch_size, output_dim).
+#         """
+#         # Direct linear mapping from latent to output
+#         return self.linear(z)
 
 class PARTIALVAE(BaseModuleClass):
     """
@@ -277,50 +445,47 @@ class PARTIALVAE(BaseModuleClass):
 
     Parameters
     ----------
-    n_input
+    n_input : int
         Number of splicing features (junctions).
-    n_batch
+    n_batch : int
         Number of batches; 0 = no batch correction.
-    n_labels
+    n_labels : int
         Number of labels; 0 = no label correction.
-    n_hidden
-        Hidden size for Encoder/Decoder combination (unused here).
-    n_latent
-        Dimension of latent space.
-    n_continuous_cov
-        Number of continuous covariates.
-    n_cats_per_cov
-        Categories per covariate list.
-    dropout_rate
-        Dropout rate for all layers.
-    splice_likelihood
-        One of:
-        * "binomial": use binomial reconstruction loss.
-        * "beta_binomial": use beta-binomial reconstruction loss.
-    latent_distribution
-        "normal" or "ln" latent prior.
-    encode_covariates
-        Whether to concatenate covariates to inputs.
-    deeply_inject_covariates
-        Whether to inject covariates in hidden layers.
-    batch_representation
-        "one-hot" or "embedding" batch encoding.
-    use_batch_norm
-        Where to apply batch norm: "none", "encoder", "decoder", "both".
-    use_layer_norm
-        Where to apply layer norm.
-    extra_payload_autotune
-        Return extra payload for autotune.
-    code_dim
-        Dimensionality of feature embeddings.
-    h_hidden_dim
-        Hidden size for shared h-layer.
-    encoder_hidden_dim
-        Hidden size for encoder final MLP.
-    decoder_hidden_dim
-        Hidden size for decoder processors.
-    learn_concentration
-        If True, learn beta-binomial concentration.
+    n_hidden : int
+        Hidden size for internal representations (unused directly here).
+    n_latent : int
+        Dimension of the latent space Z.
+    n_continuous_cov : int
+        Number of continuous covariates to include.
+    n_cats_per_cov : list[int] | None
+        Number of categories for each categorical covariate 
+        (e.g. `[n_batch] + other_cats`).
+    dropout_rate : float
+        Dropout rate applied in encoder/decoder.
+    splice_likelihood : {"binomial","beta_binomial"}
+        Which reconstruction loss to use.
+    latent_distribution : {"normal","ln"}
+        Latent prior type.
+    encode_covariates : bool
+        Whether to concatenate covariates to **encoder** inputs.
+    deeply_inject_covariates : bool
+        Whether to concatenate covariates to **decoder** inputs.
+    batch_representation : {"one-hot","embedding"}
+        How to treat the batch covariate internally.
+    use_batch_norm : {"none","encoder","decoder","both"}
+        Where to apply batch normalization.
+    use_layer_norm : {"none","encoder","decoder","both"}
+        Where to apply layer normalization.
+    extra_payload_autotune : bool
+        Return extra payload for autotune (advanced).
+    code_dim : int
+        Dimensionality of per-feature embeddings in the encoder.
+    h_hidden_dim : int
+        Hidden size for the shared “h” layer in the encoder.
+    encoder_hidden_dim : int
+        Hidden size for the final encoder MLP.
+    learn_concentration : bool
+        If True, learn Beta‐Binomial concentration parameter.
     """
     def __init__(
         self,
@@ -347,20 +512,33 @@ class PARTIALVAE(BaseModuleClass):
     ):
         super().__init__()
 
-        # Store parameters
+        # Store high-level flags
+        self.encode_covariates = encode_covariates
+        self.deeply_inject_covariates = deeply_inject_covariates
+
+        # Reconstruction / prior settings
         self.splice_likelihood = splice_likelihood
         self.latent_distribution = latent_distribution
-        self.extra_payload_autotune = extra_payload_autotune # what's this? 
-        self.learn_concentration = learn_concentration
-        self.input_dim = n_input
 
-        # Concentration parameter for Beta-Binomial
+
+        self.learn_concentration = learn_concentration
+        self.extra_payload_autotune = extra_payload_autotune
+
+        # AnnData dimensions
+        self.input_dim = n_input
+        self.n_continuous_cov = n_continuous_cov
+        self.n_cats_per_cov = n_cats_per_cov or []
+
+        cat_list = [n_batch] + list(n_cats_per_cov) if n_cats_per_cov is not None else []
+        encoder_cat_list = cat_list if encode_covariates else None
+
+        # Beta‐Binomial concentration parameter
         if learn_concentration:
             self.log_concentration = nn.Parameter(torch.tensor(0.0))
         else:
             self.log_concentration = None
 
-        # Instantiate PartialEncoder/Decoder
+        # Instantiate encoder + decoder, passing covariate specs
         self.encoder = PartialEncoder(
             input_dim=n_input,
             code_dim=code_dim,
@@ -368,11 +546,23 @@ class PARTIALVAE(BaseModuleClass):
             encoder_hidden_dim=encoder_hidden_dim,
             latent_dim=n_latent,
             dropout_rate=dropout_rate,
+            n_cat_list=encoder_cat_list,
+            n_cont=n_continuous_cov,
+            inject_covariates=encode_covariates,
         )
+        if latent_distribution == "ln":
+            self.encoder.z_transformation = nn.Softmax(dim=-1)
+        else:
+            self.encoder.z_transformation = lambda x: x
+
         self.decoder = LinearDecoder(
             latent_dim=n_latent,
             output_dim=n_input,
+            n_cat_list=cat_list,
+            n_cont=n_continuous_cov,
         )
+
+
 
     def initialize_feature_embedding_from_pca(self, pca_components: np.ndarray):
 
@@ -391,53 +581,113 @@ class PARTIALVAE(BaseModuleClass):
                 torch.tensor(pca_components, dtype=self.encoder.feature_embedding.dtype)
             )
 
-    def _get_inference_input(
-        self,
-        tensors: dict[str, torch.Tensor],
-        full_forward_pass: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        # only x and mask
-        return {
-            MODULE_KEYS.X_KEY: tensors[REGISTRY_KEYS.X_KEY],      # your input ratios
-            "mask": tensors.get(REGISTRY_KEYS.PSI_MASK_KEY, None),
-        }
 
-    def _get_generative_input(
-        self,
-        tensors: dict[str, torch.Tensor],
-        inference_outputs: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        # only z needed
-        return {MODULE_KEYS.Z_KEY: inference_outputs["z"]}
+    @auto_move_data
+    def _get_inference_input(self, tensors):
+        return {
+            MODULE_KEYS.X_KEY: tensors[REGISTRY_KEYS.X_KEY],        # your junction ratios
+            "mask":           tensors.get(REGISTRY_KEYS.PSI_MASK_KEY),
+            "batch_index":    tensors[REGISTRY_KEYS.BATCH_KEY],     # integer batch code
+            "cat_covs":       tensors.get(REGISTRY_KEYS.CAT_COVS_KEY),  # stacked one‐hot columns
+            "cont_covs":      tensors.get(REGISTRY_KEYS.CONT_COVS_KEY), # numeric covariates
+        }
 
     @auto_move_data
     def inference(
         self,
-        x: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        n_samples: int = 1,
+        x,
+        mask,
+        batch_index,
+        cat_covs=None,
+        cont_covs=None,
+        n_samples=1,
     ) -> dict[str, torch.Tensor]:
-        # 1) encode to mu, raw_logvar
-        mu, raw_logvar = self.encoder(x, mask)
-        # 2) clamp logvar then build Normal
+        # 1) prepare encoder inputs (concatenate continuous covariates if requested)
+        if cont_covs is not None and self.encode_covariates:
+            x_input = torch.cat([x, cont_covs], dim=-1)
+        else:
+            x_input = x
+
+        # 2) split out any one-hot categorical covariates
+        if cat_covs is not None and self.encode_covariates:
+            cat_list = torch.split(cat_covs, 1, dim=1)
+        else:
+            cat_list = ()
+
+        # 3) run encoder → returns (mu, raw_logvar)
+        #    we still pass batch_index as the first “category”
+        mu, raw_logvar = self.encoder(
+            x_input, mask, batch_index, *cat_list, cont=cont_covs
+        )
+
+        # --- ensure logvar is in a safe range ---
+        # prevents under/overflow in exp()
         logvar = torch.clamp(raw_logvar, min=-10.0, max=10.0)
-        qz = Normal(mu, torch.exp(0.5 * logvar))
-        # 3) sample / rsample
+
+        # 4) build the posterior Normal
+        var   = torch.exp(logvar)         # variance = exp(logvar) > 0
+        sigma = torch.sqrt(var)           # standard deviation
+        qz    = Normal(mu, sigma)
+
+        # 5) sample (rsample so that gradients flow)
         if n_samples == 1:
             z = qz.rsample()
         else:
             z = qz.sample((n_samples,))
-        # 4) return z, posterior params
-        return {"z": z, "qz_m": mu, "qz_v": torch.exp(logvar)}
-    
+
+        # 6) apply any “z_transformation” (e.g. identity or softmax)
+        z = self.encoder.z_transformation(z)
+
+        return {
+            "z":    z,      # (B, Z) or (n_samples, B, Z)
+            "qz_m": mu,     # posterior means
+            "qz_v": var,    # **variance**, not logvar
+            "x":    x,
+        }
+
+
+    def _get_generative_input(self, tensors, inference_outputs):
+        return {
+            MODULE_KEYS.Z_KEY:   inference_outputs["z"],
+            "qz_m":              inference_outputs["qz_m"],      # <<< add this
+            "batch_index":       tensors[REGISTRY_KEYS.BATCH_KEY],
+            "cat_covs":          tensors.get(REGISTRY_KEYS.CAT_COVS_KEY),
+            "cont_covs":         tensors.get(REGISTRY_KEYS.CONT_COVS_KEY),
+        }
+
     @auto_move_data
     def generative(
         self,
-        z: torch.Tensor,
+        z,
+        qz_m,
+        batch_index,
+        cat_covs=None,
+        cont_covs=None,
+        use_z_mean=False,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
-        # decode to logits → p
-        reconstruction = self.decoder(z)
+        # if you want to use the posterior mean:
+        if use_z_mean:
+            z = qz_m
+
+        # again split cat_covs → tuple
+        if cat_covs is not None:
+            cat_list = torch.split(cat_covs, 1, dim=1)
+        else:
+            cat_list = ()
+
+        # prepare decoder input by concatenating cont_covs if desired
+        decoder_input = (
+            torch.cat([z, cont_covs], dim=-1)
+            if (cont_covs is not None and self.deeply_inject_covariates)
+            else z
+        )
+
+        # finally call your decoder, passing batch_index first:
+        reconstruction = self.decoder(decoder_input, batch_index, *cat_list, cont=cont_covs)
+
         return {"reconstruction": reconstruction}
+
 
 
     def loss(

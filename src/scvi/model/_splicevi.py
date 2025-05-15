@@ -10,6 +10,7 @@ from torch.distributions import Normal
 from scvi import REGISTRY_KEYS, settings
 from scvi.data import AnnDataManager
 from scvi.data._constants import ADATA_MINIFY_TYPE
+
 from scvi.data.fields import (
     LayerField,
     CategoricalObsField,
@@ -60,6 +61,11 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         Dropout probability.
     learn_concentration
         Whether to learn Beta-Binomial concentration.
+    encode_covariates
+        If True, concatenates obs‐level covariates to each encoder/decoder input.
+    deeply_inject_covariates
+        If True, injects covariates at every hidden layer (rather than just the first).
+
     """
     _module_cls = PARTIALVAE
 
@@ -73,29 +79,41 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         dropout_rate: float = 0.1, 
         learn_concentration: bool = True,
         splice_likelihood: Literal["binomial", "beta_binomial"] = "beta_binomial",
+        encode_covariates: bool = False,
+        deeply_inject_covariates: bool = True,
         **kwargs,
     ):
         super().__init__(adata)
-        # Store hyperparameters for module init
-        self._module_kwargs = dict(
+
+        # 1) Build the kwargs we’ll pass through to the PARTIALVAE
+        #    including your two new flags.
+        self._module_kwargs: dict[str, Any] = dict(
             code_dim=code_dim,
             h_hidden_dim=h_hidden_dim,
             encoder_hidden_dim=encoder_hidden_dim,
             n_latent=latent_dim,
             dropout_rate=dropout_rate,
             learn_concentration=learn_concentration,
-            splice_likelihood = splice_likelihood,
+            splice_likelihood=splice_likelihood,
+            encode_covariates=encode_covariates,
+            deeply_inject_covariates=deeply_inject_covariates,
             **kwargs,
         )
+
+        # 2) Summary string (optional)
         self._model_summary_string = (
             f"SpliceVI PartialVAE with "
             f"h_hidden_dim={h_hidden_dim}, "
             f"encoder_hidden_dim={encoder_hidden_dim}, "
             f"latent_dim={latent_dim}, "
             f"learn_concentration={learn_concentration}, "
-            f"splice_likelihood={splice_likelihood}."
+            f"splice_likelihood={splice_likelihood}, "
+            f"encode_covariates={encode_covariates}, "
+            f"deeply_inject_covariates={deeply_inject_covariates}"
+            "."
         )
-        
+
+        # 3) If we only initialize module at train time, bail out now
         if self._module_init_on_train:
             self.module = None
             warnings.warn(
@@ -104,11 +122,24 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 stacklevel=settings.warnings_stacklevel,
             )
         else:
+            # 4) Compute how many covariates we have
             n_batch = self.summary_stats.n_batch
-            # instantiate module
+            n_cont = self.summary_stats.get("n_extra_continuous_covs", 0)
+            if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
+                n_cats = (
+                    self.adata_manager
+                        .get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+                        .n_cats_per_key
+                )
+            else:
+                n_cats = []
+
+            # 5) Instantiate your PARTIALVAE, passing everything in
             self.module = self._module_cls(
                 n_input=self.summary_stats.n_vars,
                 n_batch=n_batch,
+                n_continuous_cov=n_cont,
+                n_cats_per_cov=n_cats,
                 **self._module_kwargs,
             )
 
