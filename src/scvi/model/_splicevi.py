@@ -66,11 +66,11 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     def __init__(
         self,
         adata: AnnData | None = None,
-        code_dim: int = 16,
+        code_dim: int = 32,
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
         latent_dim: int = 10,
-        dropout_rate: float = 0.0, #0.01
+        dropout_rate: float = 0.1, 
         learn_concentration: bool = True,
         splice_likelihood: Literal["binomial", "beta_binomial"] = "beta_binomial",
         **kwargs,
@@ -118,21 +118,21 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     @devices_dsp.dedent
     def train(
         self,
-        max_epochs: int = 500,
+        max_epochs: int = 200,
         lr: float = 1e-4, # 0.001
         accelerator: str = "auto",
         devices: int | list[int] | str = "auto",
         train_size: float | None = None,
         validation_size: float | None = None,
         shuffle_set_split: bool = True,
-        batch_size: int = 128, #bigger batch size
+        batch_size: int = 512, #bigger batch size
         weight_decay: float = 1e-3, #remove weight decay
         eps: float = 1e-8,
         early_stopping: bool = True,
         save_best: bool = True,
         check_val_every_n_epoch: int | None = None,
         n_steps_kl_warmup: int | None = None,
-        n_epochs_kl_warmup: int | None = 50,
+        n_epochs_kl_warmup: int | None = 10,
         reduce_lr_on_plateau: bool = False,
         lr_factor: float = 0.6,
         lr_patience: int = 30,
@@ -224,7 +224,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             early_stopping=early_stopping,
             check_val_every_n_epoch=check_val_every_n_epoch,
             early_stopping_monitor="reconstruction_loss_validation",
-            early_stopping_patience=50,
+            early_stopping_patience=10,
             **kwargs,
         )
 
