@@ -86,6 +86,8 @@ class DecoderSplice(torch.nn.Module):
         return torch.sigmoid(ps)
 
 
+
+
 class MULTIVAESPLICE(BaseModuleClass):
     """Variational auto-encoder for joint paired and unpaired RNA-seq and alternative splicing data.
 
@@ -519,10 +521,14 @@ class MULTIVAESPLICE(BaseModuleClass):
         # Retrieve splicing count data if available
         total_counts = tensors.get("atse_counts_key", None)
         junction_counts = tensors.get("junc_counts_key", None)
+        psi_mask = tensors.get(REGISTRY_KEYS.PSI_MASK_KEY, None)
+        if psi_mask is not None:
+            psi_mask = psi_mask.to(torch.bool)
 
         # Create masks for the modality alignment penalty
         mask_expr = x_expr.sum(dim=1) > 0
         mask_spl = x_spl.sum(dim=1) > -10000000
+    
 
         # Compute Expression loss
         px_rate = generative_outputs["px_rate"]
@@ -539,6 +545,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             x_spl,
             total_counts,
             junction_counts,
+            psi_mask,
             generative_outputs["p"]
         )
         else:
@@ -596,7 +603,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             loss_val = 0.0
         return loss_val
 
-    def get_reconstruction_loss_splicing(self, x, atse_counts, junc_counts, p):
+    def get_reconstruction_loss_splicing(self, x, atse_counts, junc_counts, mask, p):
         """
         Compute the reconstruction loss for splicing data using a binomial or beta‐binomial log‐likelihood.
         Entries where atse_counts == 0 are ignored.
@@ -619,13 +626,16 @@ class MULTIVAESPLICE(BaseModuleClass):
         Tensor
             The negative log-likelihood loss for splicing.
         """
-        mask = atse_counts != 0
+        if mask is not None:
+            atse_counts = atse_counts[mask]
+            junc_counts = junc_counts[mask]
+            p = p[mask]
+
         if self.splicing_loss_type == "binomial":
             log_prob = torch.log(p + 1e-10)
             log_prob_comp = torch.log(1 - p + 1e-10)
             log_likelihood = junc_counts * log_prob + (atse_counts - junc_counts) * log_prob_comp
-            log_likelihood_masked = log_likelihood[mask]
-            return -log_likelihood_masked.mean()
+            return -log_likelihood.mean()
         elif self.splicing_loss_type == "beta_binomial":
             concentration = self.splicing_concentration
             if concentration is None:
@@ -641,8 +651,7 @@ class MULTIVAESPLICE(BaseModuleClass):
                     - torch.lgamma(alpha)
                     - torch.lgamma(beta)
                     + torch.lgamma(alpha + beta))
-            log_pm_masked = log_pm[mask]
-            return -log_pm_masked.mean()
+            return -log_pm.mean()
         else:
             raise ValueError("splicing_loss_type must be either 'binomial' or 'beta_binomial'")
 

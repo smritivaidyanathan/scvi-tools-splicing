@@ -842,6 +842,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         junc_ratio: str | None = None,
         cell_by_junction_matrix: str | None = None,
         cell_by_cluster_matrix: str | None = None,
+        psi_mask_layer: str | None = None,
         batch_key: str | None = None,
         size_factor_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
@@ -860,6 +861,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             Key in ``adata.layers`` for the cell-by-junction matrix.
         cell_by_cluster_matrix
             Key in ``adata.layers`` for the cell-by-cluster splicing matrix.
+        psi_mask_layer
+            Layer with binary mask (1=observed, 0=missing) per junction.
         %(param_batch_key)s
         %(param_size_factor_key)s
         %(param_cat_cov_keys)s
@@ -889,6 +892,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             anndata_fields.append(LayerField("cell_by_junction_matrix", cell_by_junction_matrix, is_count_data=True))
         if cell_by_cluster_matrix is not None:
             anndata_fields.append(LayerField("cell_by_cluster_matrix", cell_by_cluster_matrix, is_count_data=True))
+        if psi_mask_layer is not None:
+            anndata_fields.append(LayerField(REGISTRY_KEYS.PSI_MASK_KEY, psi_mask_layer, is_count_data=False))
         adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
@@ -902,6 +907,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         junc_ratio_layer: str | None = None,
         atse_counts_layer: str | None = None,
         junc_counts_layer: str | None = None,
+        psi_mask_layer: str | None = None,
         batch_key: str | None = None,
         size_factor_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
@@ -927,6 +933,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         junc_counts_layer
             Key in the splicing AnnData for observed junction counts.
             If `None`, defaults to `"cell_by_junction_matrix"`.
+        psi_mask_layer
+            Layer with binary mask (1=observed, 0=missing) per junction.
         %(param_batch_key)s
         size_factor_key
             Key in `mdata.obsm` for size factors.
@@ -960,10 +968,14 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             batch_key,
             mod_key=modalities.batch_key,
         )
+
+        if size_factor_key is None:
+            size_factor_key = "X_library_size"
+
         mudata_fields = [
             batch_field,
             fields.MuDataCategoricalObsField(REGISTRY_KEYS.LABELS_KEY, None, mod_key=None),
-            fields.MuDataObsmField(REGISTRY_KEYS.SIZE_FACTOR_KEY, attr_key="X_library_size",is_count_data=False),
+            fields.MuDataObsmField(REGISTRY_KEYS.SIZE_FACTOR_KEY, attr_key=size_factor_key,is_count_data=False),
             fields.MuDataCategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys, mod_key=modalities.categorical_covariate_keys),
             fields.MuDataNumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys, mod_key=modalities.continuous_covariate_keys),
             fields.MuDataNumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices", mod_key=modalities.idx_layer, required=False),
@@ -1013,6 +1025,18 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
                     junc_counts_layer,
                     mod_key=modalities.junc_ratio_layer,
                     is_count_data=True,
+                    mod_required=True,
+                )
+            )
+
+            if psi_mask_layer is None:
+                psi_mask_layer = "mask"
+            mudata_fields.append(
+                fields.MuDataLayerField(
+                    REGISTRY_KEYS.PSI_MASK_KEY,  # internal key used by the model
+                    psi_mask_layer,
+                    mod_key=modalities.junc_ratio_layer,
+                    is_count_data=False,
                     mod_required=True,
                 )
             )
