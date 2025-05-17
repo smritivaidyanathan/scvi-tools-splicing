@@ -140,7 +140,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         splicing_loss_type: Literal["binomial", "beta_binomial"] = "beta_binomial",
         splicing_concentration: float | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
-        splicing_architecture: Literal["vanilla", "partial"] = "partial",
+        splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
         code_dim: int = 32,
         h_hidden_dim: int = 64,
         mlp_encoder_hidden_dim: int = 128,
@@ -234,8 +234,18 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         import scipy.sparse as sp
     
         # 1) figure out which layer was registered as X_KEY
-        layer = self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY].attr_key
-        X = self.adata.layers[layer]
+        print(self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY])
+        juncratioinfo = self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY]
+
+        attr_key = juncratioinfo.attr_key
+        attr_name = juncratioinfo.attr_name
+        mod_key = juncratioinfo.mod_key
+
+        print(self.adata[mod_key])
+        print(self.adata[mod_key].layers)
+        print(self.adata[mod_key].layers[attr_key])
+
+        X = self.adata[mod_key].layers[attr_key]
         # 2) densify and cast
         if sp.issparse(X):
             X = X.toarray()

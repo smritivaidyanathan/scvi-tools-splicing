@@ -132,6 +132,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Iterable
 
+
 class PartialEncoder(nn.Module):
     def __init__(
         self,
@@ -146,24 +147,18 @@ class PartialEncoder(nn.Module):
         inject_covariates: bool = True,
     ):
         super().__init__()
-        # 1) Track how many categorical and continuous covariates we have
-        #    ignore any categorical with only 1 level
+        # keep track of how many one-hot cats and cont features
         self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
-        self.n_cont           = n_cont
+        self.n_cont = n_cont
         self.inject_covariates = inject_covariates
-        # total number of extra dims we'll append
         total_cov = sum(self.n_cat_list) + self.n_cont
-
-        # 2) Learnable per-feature embeddings
-        #    F_d ∈ ℝ^{input_dim × code_dim}
-        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
         self.code_dim = code_dim
 
-        # 3) Shared "h" network: input = [x_d, F_d, covariates?]
-        #    - x_d is scalar → 1
-        #    - F_d is code_dim
-        #    - plus total_cov if we're injecting covariates
-        in_dim = 1 + code_dim + (total_cov if inject_covariates else 0)
+        # per-feature embeddings
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+        # shared h-network only sees [x_d, F_d]
+        in_dim = 1 + code_dim
         self.h_layer = nn.Sequential(
             nn.Linear(in_dim, h_hidden_dim),
             nn.LayerNorm(h_hidden_dim),
@@ -174,8 +169,7 @@ class PartialEncoder(nn.Module):
             nn.ReLU(),
         )
 
-        # 4) Final MLP to get μ and log σ²: input = [c, covariates?]
-        #    where c ∈ ℝ^{code_dim} from aggregating h_out
+        # final MLP sees [c_agg, covariates]
         mlp_in = code_dim + (total_cov if inject_covariates else 0)
         self.encoder_mlp = nn.Sequential(
             nn.Linear(mlp_in, encoder_hidden_dim),
@@ -187,63 +181,43 @@ class PartialEncoder(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                # (B, D) junction ratios
-        mask: torch.Tensor,             # (B, D) observed mask
-        *cat_list: torch.Tensor,        # e.g. batch indices shape (B,1)
+        x: torch.Tensor,                # (B, D)
+        mask: torch.Tensor,             # (B, D)
+        *cat_list: torch.Tensor,        # each (B,1)
         cont: torch.Tensor | None = None,  # (B, n_cont)
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, D = x.shape
 
-
-        # Debug: show batch covariate if present
-        # if self.inject_covariates and len(cat_list) > 0:
-        #     batch_idx = cat_list[0]  # by convention we pass batch first
-        #     print("▶ PartialEncoder: batch_index unique →", torch.unique(batch_idx).tolist())
-        # if self.inject_covariates and cont is not None:
-        #     print("▶ PartialEncoder: cont_covs shape →", cont.shape)
-
-        # --- step 1: flatten each feature to feed through h_layer ---
-        x_flat = x.reshape(-1, 1)  # (B*D, 1)
-
-        # expand feature embeddings to match the flattening
+        # --- step 1: flatten features for per-feature h_layer ---
+        x_flat = x.reshape(-1, 1)  # (B*D,1)
         F_embed = (
             self.feature_embedding
-                .unsqueeze(0)       # (1, D, code_dim)
-                .expand(B, D, -1)    # (B, D, code_dim)
-                .reshape(-1, self.feature_embedding.size(1))  # (B*D, code_dim)
+                .unsqueeze(0)       # (1,D,code_dim)
+                .expand(B, D, -1)    # (B,D,code_dim)
+                .reshape(-1, self.feature_embedding.size(1))  # (B*D,code_dim)
         )
 
-        # --- step 2: build covariate matrix (if injecting) ---
-        covs: list[torch.Tensor] = []
-        if self.inject_covariates and cont is not None:
-            # repeat each cell's continuous covariates D times
-            covs.append(cont.repeat_interleave(D, dim=0))  # (B*D, n_cont)
-        for n_cat, cat in zip(self.n_cat_list, cat_list):
-            if self.inject_covariates:
-                # one-hot encode and repeat
+        # --- step 2: shared h_layer on [x_flat, F_embed] only ---
+        h_in = torch.cat([x_flat, F_embed], dim=1)  # (B*D, 1+code_dim)
+        h_out = self.h_layer(h_in).view(B, D, -1)    # (B, D, code_dim)
+
+        # --- step 3: aggregate across features with mask ---
+        mask_exp = mask.unsqueeze(-1).float()        # (B, D, 1)
+        c = (h_out * mask_exp).sum(dim=1)            # (B, code_dim)
+
+        # --- step 4: now append exactly one copy of each covariate ---
+        if self.inject_covariates:
+            cov0s: list[torch.Tensor] = []
+            if cont is not None:
+                cov0s.append(cont)  # (B, n_cont)
+            for n_cat, cat in zip(self.n_cat_list, cat_list):
                 oh = F.one_hot(cat.squeeze(-1), n_cat).float()  # (B, n_cat)
-                covs.append(oh.repeat_interleave(D, dim=0))     # (B*D, n_cat)
-        cov = torch.cat(covs, dim=1) if covs else None  # (B*D, total_cov)
+                cov0s.append(oh)
+            cov0 = torch.cat(cov0s, dim=1)  # (B, total_cov)
+            c = torch.cat([c, cov0], dim=1) # (B, code_dim + total_cov)
 
-        # --- optional debug to confirm shapes ---
-        # if cov is not None:
-        #     print(f"cov shape: {cov.shape}, expected second dim = {sum(self.n_cat_list)+self.n_cont}")
-
-        # --- step 3: apply shared h_layer ---
-        h_in = torch.cat([x_flat, F_embed, cov], dim=1) if cov is not None else torch.cat([x_flat, F_embed], dim=1)
-        h_out = self.h_layer(h_in).view(B, D, -1)  # (B, D, code_dim)
-
-        # --- step 4: mask & aggregate over features ---
-        mask_exp = mask.unsqueeze(-1).float()  # (B, D, 1)
-        c = (h_out * mask_exp).sum(dim=1)       # (B, code_dim)
-
-        # also append one copy of the covariates for the aggregated vector
-        if cov is not None:
-            cov0 = cov.view(B, D, -1)[:, 0, :]  # (B, total_cov)
-            c = torch.cat([c, cov0], dim=1)     # (B, code_dim + total_cov)
-
-        # --- final MLP to get mu and logvar ---
-        mu_logvar = self.encoder_mlp(c)         # (B, 2*latent_dim)
+        # --- final MLP to get (mu, logvar) ---
+        mu_logvar = self.encoder_mlp(c)    # (B, 2*latent_dim)
         mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
 

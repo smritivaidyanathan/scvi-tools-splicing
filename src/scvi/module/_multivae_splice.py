@@ -319,11 +319,11 @@ class MULTIVAESPLICE(BaseModuleClass):
             )
         else:
             self.z_encoder_splicing = PartialEncoder(
-            input_dim=n_input_encoder_spl,
+            input_dim=input_spl,
             code_dim=code_dim,
             h_hidden_dim=h_hidden_dim,
             encoder_hidden_dim=mlp_encoder_hidden_dim,
-            latent_dim=n_latent,
+            latent_dim=self.n_latent,
             dropout_rate=dropout_rate,
             n_cat_list=encoder_cat_list,
             n_cont=n_continuous_cov,
@@ -336,8 +336,8 @@ class MULTIVAESPLICE(BaseModuleClass):
                 self.z_encoder_splicing.z_transformation = lambda x: x
 
             self.z_decoder_splicing = LinearDecoder(
-                latent_dim=n_latent,
-                output_dim=n_input_decoder,
+                latent_dim=self.n_latent,
+                output_dim=n_input_junctions,
                 n_cat_list=cat_list,
                 n_cont=n_continuous_cov,
             )
@@ -367,9 +367,11 @@ class MULTIVAESPLICE(BaseModuleClass):
         cont_covs = tensors.get(REGISTRY_KEYS.CONT_COVS_KEY)
         cat_covs = tensors.get(REGISTRY_KEYS.CAT_COVS_KEY)
         label = tensors[REGISTRY_KEYS.LABELS_KEY]
+        psi_mask = tensors.get(REGISTRY_KEYS.PSI_MASK_KEY)
         size_factor = tensors.get(REGISTRY_KEYS.SIZE_FACTOR_KEY, None)
         return {
             "x": x,
+            "mask": psi_mask,
             "batch_index": batch_index,
             "cont_covs": cont_covs,
             "cat_covs": cat_covs,
@@ -379,7 +381,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         }
 
     @auto_move_data
-    def inference(self, x, batch_index, cont_covs, cat_covs, label, cell_idx, size_factor, n_samples=1) -> dict[str, torch.Tensor]:
+    def inference(self, x, mask, batch_index, cont_covs, cat_covs, label, cell_idx, size_factor, n_samples=1) -> dict[str, torch.Tensor]:
         """Run the inference network.
 
         Splits input x into gene expression and splicing parts, encodes each branch, and mixes their latent representations.
@@ -405,7 +407,34 @@ class MULTIVAESPLICE(BaseModuleClass):
         # Z Encoders
 
         qzm_expr, qzv_expr, z_expr = self.z_encoder_expression(encoder_input_expr, batch_index, *categorical_input)
-        qzm_spl, qzv_spl, z_spl = self.z_encoder_splicing(encoder_input_spl, batch_index, *categorical_input)
+
+        if self.splicing_architecture == "vanilla":
+            # your existing SCVI encoder
+            qzm_spl, qzv_spl, z_spl = self.z_encoder_splicing(
+                encoder_input_spl, batch_index, *categorical_input
+            )
+        else:
+            # PartialEncoder gives (mu, raw_logvar)
+            mu, raw_logvar = self.z_encoder_splicing(
+                x_spl, mask, batch_index, *categorical_input, cont=cont_covs
+            )
+            # clamp + exponentiate to get variance
+            logvar = torch.clamp(raw_logvar, min=-10.0, max=10.0)
+            var = torch.exp(logvar)
+            # build Normal dist
+            qz_dist = Normal(mu, torch.sqrt(var))
+            # sample / rsample
+            if n_samples > 1:
+                z_spl = qz_dist.sample((n_samples,))
+            else:
+                z_spl = qz_dist.rsample()
+            # apply any transformation (softmax for "ln")
+            z_spl = self.z_encoder_splicing.z_transformation(z_spl)
+            # now set the “posterior‐stats” to exactly the same names as vanilla
+            qzm_spl = mu
+            qzv_spl = var
+
+
 
         # L encoder
         if self.use_size_factor_key:
