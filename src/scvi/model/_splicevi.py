@@ -81,6 +81,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         splice_likelihood: Literal["binomial", "beta_binomial"] = "beta_binomial",
         encode_covariates: bool = False,
         deeply_inject_covariates: bool = True,
+        initialize_embeddings_from_pca: bool = True,
         **kwargs,
     ):
         super().__init__(adata)
@@ -109,7 +110,9 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             f"learn_concentration={learn_concentration}, "
             f"splice_likelihood={splice_likelihood}, "
             f"encode_covariates={encode_covariates}, "
-            f"deeply_inject_covariates={deeply_inject_covariates}"
+            f"deeply_inject_covariates={deeply_inject_covariates}, "
+            f"initialize_embeddings_from_pca={initialize_embeddings_from_pca}, "
+
             "."
         )
 
@@ -143,8 +146,41 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 **self._module_kwargs,
             )
 
+            if self.adata is not None and initialize_embeddings_from_pca:
+                self.init_feature_embedding_from_adata()
+
         self.init_params_ = self._get_init_params(locals())
 
+    
+    def init_feature_embedding_from_adata(self) -> None:
+        """
+        Center the `junc_ratio` layer, run PCA on it, and copy
+        the resulting components into the encoder.feature_embedding.
+        """
+
+        from sklearn.decomposition import PCA
+        import scipy.sparse as sp
+    
+        # 1) figure out which layer was registered as X_KEY
+        layer = self.adata_manager.data_registry[REGISTRY_KEYS.X_KEY].attr_key
+        X = self.adata.layers[layer]
+        # 2) densify and cast
+        if sp.issparse(X):
+            X = X.toarray()
+        X = np.asarray(X, dtype=float)
+        # 3) column‐wise centering
+        col_means = np.nanmean(X, axis=0)
+        X_centered = X - col_means[None, :]
+        X_centered[np.isnan(X_centered)] = 0.0
+        # 4) PCA
+        pca = PCA(n_components=self.module.encoder.code_dim)
+        pca.fit(X_centered)
+        comps = pca.components_.T  # (n_vars, code_dim)
+        # 5) copy into the encoder
+        with torch.no_grad():
+            self.module.encoder.feature_embedding.copy_(
+                torch.as_tensor(comps, dtype=self.module.encoder.feature_embedding.dtype)
+            )
     
     @devices_dsp.dedent
     def train(

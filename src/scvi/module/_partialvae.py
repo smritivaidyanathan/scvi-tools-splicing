@@ -564,6 +564,8 @@ class PARTIALVAE(BaseModuleClass):
 
 
 
+
+
     def initialize_feature_embedding_from_pca(self, pca_components: np.ndarray):
 
         """
