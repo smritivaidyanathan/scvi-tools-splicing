@@ -12,6 +12,7 @@ from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial, NegativeBinomialMixture, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers
+from scvi.module._partialvae import PartialEncoder, LinearDecoder
 
 from ._utils import masked_softmax
 
@@ -131,6 +132,15 @@ class MULTIVAESPLICE(BaseModuleClass):
         Dropout rate.
     region_factors : bool, default True
         Whether to include junction-specific factors.
+    splicing_architecture : Literal["vanilla","partial"]
+        If ``"vanilla"``, uses standard SCVI `Encoder`+`DecoderSplice`.
+        If ``"partial"``, uses `PartialEncoder`+`LinearDecoder`.
+    code_dim : int
+        Dimensionality of per‐feature embeddings in `PartialEncoder` (only for `"partial"`).
+    h_hidden_dim : int
+        Hidden size of shared “h” network in `PartialEncoder` (only for `"partial"`).
+    mlp_encoder_hidden_dim : int
+        Hidden size of the final MLP in `PartialEncoder` (only for `"partial"`).
     use_batch_norm : Literal["encoder", "decoder", "none", "both"], default "none"
         Where to apply batch normalization.
     use_layer_norm : Literal["encoder", "decoder", "none", "both"], default "both"
@@ -173,6 +183,10 @@ class MULTIVAESPLICE(BaseModuleClass):
         n_continuous_cov: int = 0,
         n_cats_per_cov: Iterable[int] | None = None,
         dropout_rate: float = 0.1,
+        splicing_architecture: Literal["vanilla", "partial"] = "partial",
+        code_dim: int = 32,
+        h_hidden_dim: int = 64,
+        mlp_encoder_hidden_dim: int = 128,
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         latent_distribution: Literal["normal", "ln"] = "normal",
@@ -202,6 +216,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         self.n_continuous_cov = n_continuous_cov
         self.dropout_rate = dropout_rate
 
+
         self.use_batch_norm_encoder = use_batch_norm in ("encoder", "both")
         self.use_batch_norm_decoder = use_batch_norm in ("decoder", "both")
         self.use_layer_norm_encoder = use_layer_norm in ("encoder", "both")
@@ -210,9 +225,13 @@ class MULTIVAESPLICE(BaseModuleClass):
         self.deeply_inject_covariates = deeply_inject_covariates
         self.use_size_factor_key = use_size_factor_key
 
-        # New splicing loss parameters
+        # New splicing parameters
         self.splicing_loss_type = splicing_loss_type
         self.splicing_concentration = splicing_concentration
+        self.splicing_architecture = splicing_architecture
+        self.code_dim = code_dim
+        self.h_hidden_dim = h_hidden_dim
+        self.mlp_encoder_hidden_dim = mlp_encoder_hidden_dim
 
         cat_list = [n_batch] + list(n_cats_per_cov) if n_cats_per_cov is not None else []
         encoder_cat_list = cat_list if encode_covariates else None
@@ -271,31 +290,57 @@ class MULTIVAESPLICE(BaseModuleClass):
         # ---------------- Splicing Branch ----------------
         input_spl = n_input_junctions if n_input_junctions > 0 else 1
         n_input_encoder_spl = input_spl + n_continuous_cov * int(encode_covariates)
-        self.z_encoder_splicing = Encoder(
-            n_input=n_input_encoder_spl,
-            n_layers=n_layers_encoder,
-            n_output=self.n_latent,
-            n_hidden=self.n_hidden,
+
+        if (splicing_architecture=="vanilla"):
+            self.z_encoder_splicing = Encoder(
+                n_input=n_input_encoder_spl,
+                n_layers=n_layers_encoder,
+                n_output=self.n_latent,
+                n_hidden=self.n_hidden,
+                n_cat_list=encoder_cat_list,
+                dropout_rate=dropout_rate,
+                activation_fn=torch.nn.LeakyReLU,
+                distribution=latent_distribution,
+                var_eps=0,
+                use_batch_norm=self.use_batch_norm_encoder,
+                use_layer_norm=self.use_layer_norm_encoder,
+                return_dist=False,
+            )
+            self.z_decoder_splicing = DecoderSplice(
+                n_input=n_input_decoder,
+                n_output=n_input_junctions,
+                n_cat_list=cat_list,
+                n_layers=n_layers_decoder,
+                n_hidden=self.n_hidden,
+                dropout_rate=dropout_rate,
+                use_batch_norm=self.use_batch_norm_decoder,
+                use_layer_norm=self.use_layer_norm_decoder,
+                deep_inject_covariates=deeply_inject_covariates,
+            )
+        else:
+            self.z_encoder_splicing = PartialEncoder(
+            input_dim=n_input_encoder_spl,
+            code_dim=code_dim,
+            h_hidden_dim=h_hidden_dim,
+            encoder_hidden_dim=mlp_encoder_hidden_dim,
+            latent_dim=n_latent,
+            dropout_rate=dropout_rate,
             n_cat_list=encoder_cat_list,
-            dropout_rate=dropout_rate,
-            activation_fn=torch.nn.LeakyReLU,
-            distribution=latent_distribution,
-            var_eps=0,
-            use_batch_norm=self.use_batch_norm_encoder,
-            use_layer_norm=self.use_layer_norm_encoder,
-            return_dist=False,
-        )
-        self.z_decoder_splicing = DecoderSplice(
-            n_input=n_input_decoder,
-            n_output=n_input_junctions,
-            n_cat_list=cat_list,
-            n_layers=n_layers_decoder,
-            n_hidden=self.n_hidden,
-            dropout_rate=dropout_rate,
-            use_batch_norm=self.use_batch_norm_decoder,
-            use_layer_norm=self.use_layer_norm_decoder,
-            deep_inject_covariates=deeply_inject_covariates,
-        )
+            n_cont=n_continuous_cov,
+            inject_covariates=encode_covariates,
+            )
+
+            if latent_distribution == "ln":
+                self.z_encoder_splicing.z_transformation = nn.Softmax(dim=-1)
+            else:
+                self.z_encoder_splicing.z_transformation = lambda x: x
+
+            self.z_decoder_splicing = LinearDecoder(
+                latent_dim=n_latent,
+                output_dim=n_input_decoder,
+                n_cat_list=cat_list,
+                n_cont=n_continuous_cov,
+            )
 
         # ---------------- Modality Alignment ----------------
         self.n_obs = n_obs

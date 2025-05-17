@@ -89,6 +89,18 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         Likelihood for gene expression. One of: ``"zinb"``, ``"nb"``, ``"poisson"``.
     dispersion
         Dispersion configuration. Options are: ``"gene"``, ``"gene-batch"``, ``"gene-label"``, or ``"gene-cell"``.
+    splicing_architecture
+        Which encoder/decoder to use for splicing. One of:
+        * ``"vanilla"``: standard SCVI `Encoder` + `DecoderSplice`,
+        * ``"partial"``: `PartialEncoder` + `LinearDecoder` with per‐feature embeddings.
+    code_dim
+        Dimensionality of per‐feature embeddings in the *partial* encoder (only used when `splicing_architecture="partial"`).
+    h_hidden_dim
+        Hidden size of the shared “h” network in `PartialEncoder` (only for `"partial"`).
+    mlp_encoder_hidden_dim
+        Hidden size of the final MLP in `PartialEncoder` (only for `"partial"`).
+    initialize_embeddings_from_pca
+        Whether or not to initalize the embedding layer for the Partial Encoder using PCA of junction ratios (only for `"partial"`).
     use_batch_norm
         Which layers to apply batch normalization to. Options: ``"encoder"``, ``"decoder"``, ``"both"``, or ``"none"``.
     use_layer_norm
@@ -102,7 +114,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
     fully_paired
         Indicates if the data is fully paired across modalities.
     **model_kwargs
-        Additional keyword arguments for :class:`~scvi.module.MULTIVISPLICE`.
+        Additional keyword arguments for :class:`~scvi.module.MULTIVAESPLICE`.
     
     Notes
     -----
@@ -128,6 +140,11 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         splicing_loss_type: Literal["binomial", "beta_binomial"] = "beta_binomial",
         splicing_concentration: float | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
+        splicing_architecture: Literal["vanilla", "partial"] = "partial",
+        code_dim: int = 32,
+        h_hidden_dim: int = 64,
+        mlp_encoder_hidden_dim: int = 128,
+        initialize_embeddings_from_pca: bool = True,
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         latent_distribution: Literal["normal", "ln"] = "normal",
@@ -173,6 +190,10 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             splicing_concentration = splicing_concentration,
             gene_likelihood=gene_likelihood,
             gene_dispersion=dispersion,
+            splicing_architecture = splicing_architecture,
+            code_dim= code_dim,
+            h_hidden_dim= h_hidden_dim,
+            mlp_encoder_hidden_dim= mlp_encoder_hidden_dim,
             use_batch_norm=use_batch_norm,
             use_layer_norm=use_layer_norm,
             use_size_factor_key=use_size_factor_key,
@@ -183,13 +204,15 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         )
 
         self._model_summary_string = (
-            f"MultiVI Splice Model with the following params: \nn_genes: {n_genes}, "
-            f"n_junctions: {n_junctions}, n_hidden: {self.module.n_hidden}, "
-            f"n_latent: {self.module.n_latent}, n_layers_encoder: {n_layers_encoder}, "
-            f"n_layers_decoder: {n_layers_decoder}, dropout_rate: {dropout_rate}, "
-            f"latent_distribution: {latent_distribution}, deep injection: {deeply_inject_covariates}, "
-            f"gene_likelihood: {gene_likelihood}, gene_dispersion: {dispersion}, "
-            f"Mod.Weights: {modality_weights}, Mod.Penalty: {modality_penalty}"
+            f"MultiVI Splice Model with n_genes={n_genes}, n_junctions={n_junctions}, "
+            f"n_hidden={self.module.n_hidden}, n_latent={self.module.n_latent}, "
+            f"n_layers_encoder={n_layers_encoder}, n_layers_decoder={n_layers_decoder}, "
+            f"dropout_rate={dropout_rate}, latent_distribution={latent_distribution}, "
+            f"splicing_architecture={splicing_architecture}, code_dim={code_dim}, "
+            f"splicing_loss_type={splicing_loss_type}, splicing_concentration={splicing_concentration}, init_from_pca={initialize_embeddings_from_pca}, "
+            f"h_hidden_dim={h_hidden_dim}, mlp_encoder_hidden_dim={mlp_encoder_hidden_dim}, "
+            f"gene_likelihood={gene_likelihood}, dispersion={dispersion}, "
+            f"modality_weights={modality_weights}, modality_penalty={modality_penalty}"
         )
         self.fully_paired = fully_paired
         self.n_latent = n_latent
@@ -197,6 +220,40 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         self.n_genes = n_genes
         self.n_junctions = n_junctions
         self.get_normalized_function_name = "get_normalized_splicing"
+
+        if self.adata is not None and initialize_embeddings_from_pca and splicing_architecture == "partial":
+                self.init_feature_embedding_from_adata()
+
+    def init_feature_embedding_from_adata(self) -> None:
+        """
+        Center the `junc_ratio` layer in the splicing modality, run PCA on it, and copy
+        the resulting components into the encoder.feature_embedding.
+        """
+
+        from sklearn.decomposition import PCA
+        import scipy.sparse as sp
+    
+        # 1) figure out which layer was registered as X_KEY
+        layer = self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY].attr_key
+        X = self.adata.layers[layer]
+        # 2) densify and cast
+        if sp.issparse(X):
+            X = X.toarray()
+        X = np.asarray(X, dtype=float)
+        # 3) column‐wise centering
+        col_means = np.nanmean(X, axis=0)
+        X_centered = X - col_means[None, :]
+        X_centered[np.isnan(X_centered)] = 0.0
+        # 4) PCA
+        pca = PCA(n_components=self.module.z_encoder_splicing.code_dim)
+        pca.fit(X_centered)
+        comps = pca.components_.T  # (n_vars, code_dim)
+        # 5) copy into the encoder
+        with torch.no_grad():
+            self.module.z_encoder_splicing.feature_embedding.copy_(
+                torch.as_tensor(comps, dtype=self.module.z_encoder_splicing.feature_embedding.dtype)
+            )
+    
 
     @devices_dsp.dedent
     def train(
