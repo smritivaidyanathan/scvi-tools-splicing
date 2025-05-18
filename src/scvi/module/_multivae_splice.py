@@ -728,56 +728,50 @@ class MULTIVAESPLICE(BaseModuleClass):
         return loss_val
 
     def get_reconstruction_loss_splicing(self, x, atse_counts, junc_counts, mask, p):
-        """
-        Compute the reconstruction loss for splicing data using a binomial or beta‐binomial log‐likelihood.
-        Entries where atse_counts == 0 are ignored.
-
-        Uses the instance attributes `splicing_loss_type` and `splicing_concentration`.
-
-        Parameters
-        ----------
-        x : Tensor
-            Input tensor for splicing (unused, kept for compatibility).
-        atse_counts : Tensor
-            Total counts per event.
-        junc_counts : Tensor
-            Observed junction counts.
-        p : Tensor
-            Decoded splicing probabilities.
-
-        Returns
-        -------
-        Tensor
-            The negative log-likelihood loss for splicing.
-        """
+        # ignore unobserved
         if mask is not None:
             atse_counts = atse_counts[mask]
             junc_counts = junc_counts[mask]
             p = p[mask]
 
+        # clamp once for both branches
+        eps = 1e-8
+        p = p.clamp(min=eps, max=1 - eps)
+
         if self.splicing_loss_type == "binomial":
-            log_prob = torch.log(p + 1e-10)
-            log_prob_comp = torch.log(1 - p + 1e-10)
-            log_likelihood = junc_counts * log_prob + (atse_counts - junc_counts) * log_prob_comp
+            log_prob      = torch.log(p)
+            log_prob_comp = torch.log(1 - p)
+            log_likelihood = (
+                junc_counts * log_prob
+            + (atse_counts - junc_counts) * log_prob_comp
+            )
             return -log_likelihood.mean()
+
         elif self.splicing_loss_type == "beta_binomial":
-            concentration = self.splicing_concentration
-            if concentration is None:
-                concentration = torch.tensor(1.0, device=p.device)
+            concentration = (
+                torch.tensor(1.0, device=p.device)
+                if self.splicing_concentration is None
+                else self.splicing_concentration
+            )
             alpha = p * concentration
-            beta = (1 - p) * concentration
-            log_pm = (torch.lgamma(atse_counts + 1)
-                    - torch.lgamma(junc_counts + 1)
-                    - torch.lgamma(atse_counts - junc_counts + 1)
-                    + torch.lgamma(junc_counts + alpha)
-                    + torch.lgamma(atse_counts - junc_counts + beta)
-                    - torch.lgamma(atse_counts + alpha + beta)
-                    - torch.lgamma(alpha)
-                    - torch.lgamma(beta)
-                    + torch.lgamma(alpha + beta))
+            beta  = (1 - p) * concentration
+
+            log_pm = (
+                torch.lgamma(atse_counts + 1)
+            - torch.lgamma(junc_counts + 1)
+            - torch.lgamma(atse_counts - junc_counts + 1)
+            + torch.lgamma(junc_counts + alpha)
+            + torch.lgamma(atse_counts - junc_counts + beta)
+            - torch.lgamma(atse_counts + alpha + beta)
+            - torch.lgamma(alpha)
+            - torch.lgamma(beta)
+            + torch.lgamma(alpha + beta)
+            )
             return -log_pm.mean()
+
         else:
-            raise ValueError("splicing_loss_type must be either 'binomial' or 'beta_binomial'")
+            raise ValueError("splicing_loss_type must be 'binomial' or 'beta_binomial'")
+
 
 
 
