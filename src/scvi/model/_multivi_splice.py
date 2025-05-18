@@ -226,44 +226,56 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
 
     def init_feature_embedding_from_adata(self) -> None:
         """
-        Center the `junc_ratio` layer in the splicing modality, run PCA on it, and copy
+        Center the `junc_ratio` layer, run PCA on it, and copy
         the resulting components into the encoder.feature_embedding.
+        Entries where ATSE count == 0 are temporarily set to NaN
+        so that nanmean skips them.
         """
 
         from sklearn.decomposition import PCA
         import scipy.sparse as sp
-    
-        # 1) figure out which layer was registered as X_KEY
-        print(self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY])
-        juncratioinfo = self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY]
+        import numpy as np
+        import torch
 
-        attr_key = juncratioinfo.attr_key
-        attr_name = juncratioinfo.attr_name
-        mod_key = juncratioinfo.mod_key
+        jr_info = self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY]
+        jr_key, mod_key = jr_info.attr_key, jr_info.mod_key
 
-        print(self.adata[mod_key])
-        print(self.adata[mod_key].layers)
-        print(self.adata[mod_key].layers[attr_key])
+        ac_info = self.adata_manager.data_registry["atse_counts_key"]
+        ac_key = ac_info.attr_key
 
-        X = self.adata[mod_key].layers[attr_key]
+        # 2) Grab as CSR matrices
+        X = self.adata[mod_key].layers[jr_key]
+        C = self.adata[mod_key].layers[ac_key]
+
         # 2) densify and cast
         if sp.issparse(X):
             X = X.toarray()
         X = np.asarray(X, dtype=float)
-        # 3) column‐wise centering
+    
+        if sp.issparse(C):
+            C = C.toarray()
+        # set all X entries to NaN where C == 0
+        X[C == 0] = np.nan
+        # ——————————————————————————————————————————————————
+
+        # 3) column‐wise centering (ignores those NaNs)
         col_means = np.nanmean(X, axis=0)
         X_centered = X - col_means[None, :]
+        # turn the NaNs (masked spots) into zeros
         X_centered[np.isnan(X_centered)] = 0.0
+
         # 4) PCA
         pca = PCA(n_components=self.module.z_encoder_splicing.code_dim)
         pca.fit(X_centered)
         comps = pca.components_.T  # (n_vars, code_dim)
+
         # 5) copy into the encoder
         with torch.no_grad():
             self.module.z_encoder_splicing.feature_embedding.copy_(
                 torch.as_tensor(comps, dtype=self.module.z_encoder_splicing.feature_embedding.dtype)
             )
-    
+        X[C == 0] = 0
+
 
     @devices_dsp.dedent
     def train(

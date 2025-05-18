@@ -408,6 +408,12 @@ class MULTIVAESPLICE(BaseModuleClass):
 
         qzm_expr, qzv_expr, z_expr = self.z_encoder_expression(encoder_input_expr, batch_index, *categorical_input)
 
+        # print(
+        #     "ExprEncoder:",
+        #     f"qzm_expr NaNs={torch.isnan(qzm_expr).sum().item()},",
+        #     f"qzv_expr NaNs={torch.isnan(qzv_expr).sum().item()}"
+        # )
+
         if self.splicing_architecture == "vanilla":
             # your existing SCVI encoder
             qzm_spl, qzv_spl, z_spl = self.z_encoder_splicing(
@@ -415,12 +421,26 @@ class MULTIVAESPLICE(BaseModuleClass):
             )
         else:
             # PartialEncoder gives (mu, raw_logvar)
+            #print(f"x_spl min/max={x_spl.min().item():.3e}/{x_spl.max().item():.3e}, mask sum={mask.sum().item()}")
+
             mu, raw_logvar = self.z_encoder_splicing(
                 x_spl, mask, batch_index, *categorical_input, cont=cont_covs
             )
+
+            # print(
+            #     "PartialEncoder output:",
+            #     f"mu shape={tuple(mu.shape)},  raw_logvar shape={tuple(raw_logvar.shape)}",
+            #     f"  mu NaNs={torch.isnan(mu).sum().item()},",
+            #     f" raw_logvar NaNs={torch.isnan(raw_logvar).sum().item()}",
+            # )
             # clamp + exponentiate to get variance
             logvar = torch.clamp(raw_logvar, min=-10.0, max=10.0)
             var = torch.exp(logvar)
+
+            # print(
+            #     f"  var min/max = {var.min().item():.3e}/{var.max().item():.3e},",
+            #     f" var NaNs ={torch.isnan(var).sum().item()}",
+            # )
             # build Normal dist
             qz_dist = Normal(mu, torch.sqrt(var))
             # sample / rsample
@@ -428,6 +448,10 @@ class MULTIVAESPLICE(BaseModuleClass):
                 z_spl = qz_dist.sample((n_samples,))
             else:
                 z_spl = qz_dist.rsample()
+
+            # print(
+            #     f"  z_spl shape={tuple(z_spl.shape)}, NaNs={torch.isnan(z_spl).sum().item()}"
+            # )
             # apply any transformation (softmax for "ln")
             z_spl = self.z_encoder_splicing.z_transformation(z_spl)
             # now set the “posterior‐stats” to exactly the same names as vanilla
@@ -454,6 +478,12 @@ class MULTIVAESPLICE(BaseModuleClass):
         qz_m = mix_modalities((qzm_expr, qzm_spl), (mask_expr, mask_spl), weights)
         qz_v = mix_modalities((qzv_expr, qzv_spl), (mask_expr, mask_spl), weights, torch.sqrt)
         qz_v = torch.clamp(qz_v, min=1e-6)
+
+        # print(
+        #     "After mix:",
+        #     f"qz_m NaNs={torch.isnan(qz_m).sum().item()},",
+        #     f"qz_v NaNs={torch.isnan(qz_v).sum().item()}"
+        # )
 
 
         # sample
@@ -543,7 +573,17 @@ class MULTIVAESPLICE(BaseModuleClass):
         else:
             decoder_input = torch.cat([latent, cont_covs], dim=-1)
         # Splicing Decoder
-        p_s = self.z_decoder_splicing(decoder_input, batch_index, *categorical_input)
+        if self.splicing_architecture == "vanilla":
+            # vanilla Encoder→DecoderSplice expects (decoder_input, batch, *cats)
+            # and decoder_input already has conts baked in upstream
+            p_s = self.z_decoder_splicing(decoder_input, batch_index, *categorical_input)
+        else:
+            # partial: LinearDecoder takes (z, *cat_list, cont=cont_covs)
+            # **do not** concatenate cont_covs into z yourself!
+            p_s_logits = self.z_decoder_splicing(latent, batch_index, *categorical_input, cont=cont_covs)
+            # …then squash into probabilities
+            p_s = torch.sigmoid(p_s_logits)
+
         # Expression Decoder
         px_scale, _, px_rate, px_dropout = self.z_decoder_expression(
             self.gene_dispersion,
@@ -553,6 +593,8 @@ class MULTIVAESPLICE(BaseModuleClass):
             *categorical_input,
             label,
         )
+
+        
         # Expression Dispersion
         if self.gene_dispersion == "gene-label":
             px_r = F.linear(
@@ -645,6 +687,14 @@ class MULTIVAESPLICE(BaseModuleClass):
             mask_expr,
             mask_spl
         )
+
+        # print(
+        #     "[Loss] rl_expr: ",
+        #     float(rl_expression.mean()), "nan_count:", int(torch.isnan(rl_expression).sum()),
+        #     " | rl_spl:", float(rl_splicing.mean()), "nan_count:", int(torch.isnan(rl_splicing).sum()),
+        #     " | KL_z:", float(kl_div_z.mean()), "nan_count:", int(torch.isnan(kl_div_z).sum()),
+        #     " | KL_paired:", float(kl_div_paired.mean()), "nan_count:", int(torch.isnan(kl_div_paired).sum())
+        # )
 
         # KL WARMUP
         kl_local_for_warmup = kl_div_z
