@@ -434,8 +434,10 @@ class MULTIVAESPLICE(BaseModuleClass):
             #     f" raw_logvar NaNs={torch.isnan(raw_logvar).sum().item()}",
             # )
             # clamp + exponentiate to get variance
-            logvar = torch.clamp(raw_logvar, min=-10.0, max=10.0)
-            var = torch.exp(logvar)
+            # logvar = torch.clamp(raw_logvar, min=-5.0, max=5.0)
+            # var = torch.exp(logvar)
+
+            var = F.softplus(raw_logvar) + 1e-6
 
             # print(
             #     f"  var min/max = {var.min().item():.3e}/{var.max().item():.3e},",
@@ -627,6 +629,31 @@ class MULTIVAESPLICE(BaseModuleClass):
         LossOutput
             A container with total loss, reconstruction losses, and KL divergence details.
         """
+
+        for name, val in inference_outputs.items():
+            if isinstance(val, torch.Tensor):
+                mask_finite = torch.isfinite(val)
+                if not mask_finite.all():
+                    # compute range over the finite entries
+                    finite = val[mask_finite]
+                    vmin = finite.min().item() if finite.numel() else float("nan")
+                    vmax = finite.max().item() if finite.numel() else float("nan")
+                    print(f"[loss][ERROR] inference_outputs['{name}'] has non-finite values!"
+                            f"  finite range = {vmin:.4e} → {vmax:.4e}")
+                    assert False, f"inference_outputs['{name}'] contains non-finite entries"
+
+        # --- only-on-error checks & stats for generative_outputs ---
+        for name, val in generative_outputs.items():
+            if isinstance(val, torch.Tensor):
+                mask_finite = torch.isfinite(val)
+                if not mask_finite.all():
+                    finite = val[mask_finite]
+                    vmin = finite.min().item() if finite.numel() else float("nan")
+                    vmax = finite.max().item() if finite.numel() else float("nan")
+                    print(f"[loss][ERROR] generative_outputs['{name}'] has non-finite values!"
+                            f"  finite range = {vmin:.4e} → {vmax:.4e}")
+                    assert False, f"generative_outputs['{name}'] contains non-finite entries"
+
         # Get the data
         x = inference_outputs["x"]
 

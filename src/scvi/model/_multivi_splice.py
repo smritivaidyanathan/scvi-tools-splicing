@@ -331,7 +331,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         """
         update_dict = {
             "lr": lr,
-            "adversarial_classifier": adversarial_mixing,
+            "lr_patience": 5,
+            "adversarial_classifier": False,
             "weight_decay": weight_decay,
             "eps": eps,
             "n_epochs_kl_warmup": n_epochs_kl_warmup,
@@ -378,7 +379,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             early_stopping=early_stopping,
             check_val_every_n_epoch=check_val_every_n_epoch,
             early_stopping_monitor="reconstruction_loss_validation",
-            early_stopping_patience=50,
+            early_stopping_patience=10,
+            gradient_clip_val=5,
             **kwargs,
         )
         return runner()
