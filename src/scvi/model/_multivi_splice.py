@@ -49,6 +49,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+import torch
+from scvi.train import AdversarialTrainingPlan
+
+class MyAdvTrainingPlan(AdversarialTrainingPlan):
+    def compute_and_log_metrics(self, loss_output, metrics, mode):
+        # 1. original ELBO, total recon, total KL, and extra‐metrics
+        super().compute_and_log_metrics(loss_output, metrics, mode)
+
+        # 2. now log each modality’s recon loss as the *batch mean*
+        for key, val in loss_output.reconstruction_loss.items():
+            if isinstance(val, torch.Tensor):
+                # val might be a vector of per-cell losses → take mean
+                val = val.mean()
+            self.log(
+                f"{key}_{mode}",
+                val,
+                on_step=False,
+                on_epoch=True,
+                batch_size=loss_output.n_obs_minibatch,
+                sync_dist=self.use_sync_dist,
+            )
+
 
 class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin):
     """Integration of gene expression and alternative splicing signals.
@@ -122,7 +144,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
     * The splicing modality does not use library size factors.
     """
     _module_cls = MULTIVAESPLICE
-    _training_plan_cls = AdversarialTrainingPlan
+    _training_plan_cls = MyAdvTrainingPlan
 
     def __init__(
         self,
@@ -380,7 +402,6 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             check_val_every_n_epoch=check_val_every_n_epoch,
             early_stopping_monitor="reconstruction_loss_validation",
             early_stopping_patience=10,
-            gradient_clip_val=5,
             **kwargs,
         )
         return runner()
