@@ -297,10 +297,34 @@ class Encoder(nn.Module):
             tensors of shape ``(n_latent,)`` for mean and var, and sample
 
         """
+
         # Parameters for latent distribution
         q = self.encoder(x, *cat_list)
         q_m = self.mean_encoder(q)
         q_v = self.var_activation(self.var_encoder(q)) + self.var_eps
+
+        # 1) q_m must be finite
+        if torch.isnan(q_m).any():
+            print("ERROR: q_m contains NaNs")
+            print("  input  x:", x)
+            print("  hidden q:", q)
+        assert not torch.isnan(q_m).any(), "q_m contains NaNs!"
+
+        # 2) q_v must be finite
+        if torch.isnan(q_v).any():
+            print("ERROR: q_v contains NaNs")
+            print("  input  x:", x)
+            print("  hidden q:", q)
+        assert not torch.isnan(q_v).any(), "q_v contains NaNs!"
+
+        # 3) q_v must be non‐negative
+        min_var = q_v.min().item()
+        if min_var < 0:
+            print(f"ERROR: q_v has negative values (min={min_var:.4e})")
+            print("  input  x:", x)
+            print("  hidden q:", q)
+        assert min_var >= 0, f"q_v contains negative values (min={min_var:.4e})"
+
         dist = Normal(q_m, q_v.sqrt())
         latent = self.z_transformation(dist.rsample())
         if self.return_dist:

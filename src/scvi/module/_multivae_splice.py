@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial, NegativeBinomialMixture, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
-from scvi.nn import DecoderSCVI, Encoder, FCLayers
+from scvi.nn import DecoderSCVI, Encoder, FCLayers, LinearDecoderSCVI
 from scvi.module._partialvae import PartialEncoder, LinearDecoder
 
 from ._utils import masked_softmax
@@ -183,7 +183,8 @@ class MULTIVAESPLICE(BaseModuleClass):
         n_continuous_cov: int = 0,
         n_cats_per_cov: Iterable[int] | None = None,
         dropout_rate: float = 0.1,
-        splicing_architecture: Literal["vanilla", "partial"] = "partial",
+        splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
+        expression_architecture: Literal["vanilla", "linear"] = "vanilla",
         code_dim: int = 32,
         h_hidden_dim: int = 64,
         mlp_encoder_hidden_dim: int = 128,
@@ -275,17 +276,27 @@ class MULTIVAESPLICE(BaseModuleClass):
             deep_inject_covariates=deeply_inject_covariates,
         )
         n_input_decoder = self.n_latent + self.n_continuous_cov
-        self.z_decoder_expression = DecoderSCVI(
-            n_input_decoder,
-            n_input_genes,
-            n_cat_list=cat_list,
-            n_layers=n_layers_decoder,
-            n_hidden=self.n_hidden,
-            inject_covariates=deeply_inject_covariates,
-            use_batch_norm=self.use_batch_norm_decoder,
-            use_layer_norm=self.use_layer_norm_decoder,
-            scale_activation="softplus" if use_size_factor_key else "softmax",
-        )
+
+        if expression_architecture == "vanilla":
+            self.z_decoder_expression = DecoderSCVI(
+                n_input_decoder,
+                n_input_genes,
+                n_cat_list=cat_list,
+                n_layers=n_layers_decoder,
+                n_hidden=self.n_hidden,
+                inject_covariates=deeply_inject_covariates,
+                use_batch_norm=self.use_batch_norm_decoder,
+                use_layer_norm=self.use_layer_norm_decoder,
+                scale_activation="softplus" if use_size_factor_key else "softmax",
+            )
+        else:
+            self.z_decoder_expression = LinearDecoderSCVI(
+                n_input_decoder,
+                n_input_genes,
+                n_cat_list=cat_list,
+                use_batch_norm=self.use_batch_norm_decoder,
+                use_layer_norm=self.use_layer_norm_decoder,
+            )
 
         # ---------------- Splicing Branch ----------------
         input_spl = n_input_junctions if n_input_junctions > 0 else 1

@@ -27,12 +27,16 @@ from scvi.model._utils import (
     scrna_raw_counts_properties,
     use_distributed_sampler,
 )
+from scvi.module.base import (
+    BaseModuleClass,
+)
 from scvi.model.base import (
     ArchesMixin,
     BaseModelClass,
     UnsupervisedTrainingMixin,
     VAEMixin,
 )
+
 from scvi.model.base._de_core import _de_core
 from scvi.module import MULTIVAESPLICE
 from scvi.train import AdversarialTrainingPlan
@@ -52,7 +56,25 @@ logger = logging.getLogger(__name__)
 import torch
 from scvi.train import AdversarialTrainingPlan
 
+from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
+
 class MyAdvTrainingPlan(AdversarialTrainingPlan):
+
+    def __init__(
+        self,
+        module: BaseModuleClass,
+        *,
+        # keep all your existing AdversarialTrainingPlan args here…
+        lr_scheduler_type: Literal["plateau", "step"] = "plateau",
+        step_size: int = 10,
+        **kwargs,
+    ):
+        super().__init__(module=module, **kwargs)
+        # new scheduling params
+        self.lr_scheduler_type = lr_scheduler_type
+        self.step_size = step_size
+
+
     def compute_and_log_metrics(self, loss_output, metrics, mode):
         # 1. original ELBO, total recon, total KL, and extra‐metrics
         super().compute_and_log_metrics(loss_output, metrics, mode)
@@ -70,6 +92,78 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
                 batch_size=loss_output.n_obs_minibatch,
                 sync_dist=self.use_sync_dist,
             )
+
+        # 3. now also log the current learning rate
+        optim = self.optimizers()
+        # if you got back multiple optimizers, pick the first
+        optim = optim[0] if isinstance(optim, list) else optim
+        # get the lr of the first param‐group
+        current_lr = optim.param_groups[0]["lr"]
+        # attach mode so you can see train_lr vs validation_lr if you like
+        self.log(
+            f"lr_{mode}",
+            current_lr,
+            on_step=True,     # logs every step
+            on_epoch=False,   # not aggregated at epoch end
+        )
+
+    def configure_optimizers(self):
+        """Configure optimizers for adversarial training."""
+        params1 = filter(lambda p: p.requires_grad, self.module.parameters())
+        optimizer1 = self.get_optimizer_creator()(params1)
+        config1 = {"optimizer": optimizer1}
+        if self.lr_scheduler_type == "step":
+            scheduler = StepLR(
+                optimizer1,
+                step_size=self.step_size,
+                gamma=self.lr_factor,
+            )
+            config1.update(
+                {
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "interval": "epoch",
+                    },
+                },
+            )
+            
+        elif self.reduce_lr_on_plateau and self.lr_scheduler_type == "plateau":
+            scheduler1 = ReduceLROnPlateau(
+                optimizer1,
+                patience=self.lr_patience,
+                factor=self.lr_factor,
+                threshold=self.lr_threshold,
+                min_lr=self.lr_min,
+                threshold_mode="abs",
+                verbose=True,
+            )
+            config1.update(
+                {
+                    "lr_scheduler": {
+                        "scheduler": scheduler1,
+                        "monitor": self.lr_scheduler_metric,
+                    },
+                },
+            )
+
+        if self.adversarial_classifier is not False:
+            params2 = filter(lambda p: p.requires_grad, self.adversarial_classifier.parameters())
+            optimizer2 = torch.optim.Adam(
+                params2, lr=1e-3, eps=0.01, weight_decay=self.weight_decay
+            )
+            config2 = {"optimizer": optimizer2}
+
+            # pytorch lightning requires this way to return
+            opts = [config1.pop("optimizer"), config2["optimizer"]]
+            if "lr_scheduler" in config1:
+                scheds = [config1["lr_scheduler"]]
+                return opts, scheds
+            else:
+                return opts
+
+        return config1
+
+
 
 
 class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin):
@@ -115,6 +209,10 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         Which encoder/decoder to use for splicing. One of:
         * ``"vanilla"``: standard SCVI `Encoder` + `DecoderSplice`,
         * ``"partial"``: `PartialEncoder` + `LinearDecoder` with per‐feature embeddings.
+    expression_architecture
+        Which decoder to use for gene expression. One of:
+        * ``"vanilla"``: standard SCVI `Encoder` +  Standard SCVI Decoder
+        * ``"linear"``: standard SCVI `Encoder` + Linear SCVI Decoder
     code_dim
         Dimensionality of per‐feature embeddings in the *partial* encoder (only used when `splicing_architecture="partial"`).
     h_hidden_dim
@@ -163,6 +261,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         splicing_concentration: float | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
+        expression_architecture: Literal["vanilla", "linear"] = "vanilla",
         code_dim: int = 32,
         h_hidden_dim: int = 64,
         mlp_encoder_hidden_dim: int = 128,
@@ -213,6 +312,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             gene_likelihood=gene_likelihood,
             gene_dispersion=dispersion,
             splicing_architecture = splicing_architecture,
+            expression_architecture = expression_architecture, 
             code_dim= code_dim,
             h_hidden_dim= h_hidden_dim,
             mlp_encoder_hidden_dim= mlp_encoder_hidden_dim,
@@ -230,6 +330,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             f"n_hidden={self.module.n_hidden}, n_latent={self.module.n_latent}, "
             f"n_layers_encoder={n_layers_encoder}, n_layers_decoder={n_layers_decoder}, "
             f"dropout_rate={dropout_rate}, latent_distribution={latent_distribution}, "
+            f"expression_architecture={expression_architecture}, "
             f"splicing_architecture={splicing_architecture}, code_dim={code_dim}, "
             f"splicing_loss_type={splicing_loss_type}, splicing_concentration={splicing_concentration}, init_from_pca={initialize_embeddings_from_pca}, "
             f"h_hidden_dim={h_hidden_dim}, mlp_encoder_hidden_dim={mlp_encoder_hidden_dim}, "
@@ -313,11 +414,21 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         weight_decay: float = 1e-3,
         eps: float = 1e-08,
         early_stopping: bool = True,
+        early_stopping_patience: int = 50,
         save_best: bool = True,
         check_val_every_n_epoch: int | None = None,
         n_steps_kl_warmup: int | None = None,
         n_epochs_kl_warmup: int | None = 50,
         adversarial_mixing: bool = True,
+        lr_scheduler_type: Literal["plateau", "step"] = "plateau",
+        reduce_lr_on_plateau: bool = False,
+        lr_factor: float = 0.6,
+        lr_patience: int = 30,
+        lr_threshold: float = 0.0,
+        lr_scheduler_metric: Literal[
+            "elbo_validation", "reconstruction_loss_validation", "kl_local_validation"
+        ] = "elbo_validation",
+        step_size: int = 10,
         datasplitter_kwargs: dict | None = None,
         plan_kwargs: dict | None = None,
         **kwargs,
@@ -333,28 +444,57 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         accelerator, devices
             Hardware acceleration options.
         train_size, validation_size
-            Proportions for splitting the data.
+            Proportions for splitting the data into train and validation sets.
         shuffle_set_split
-            Whether to shuffle indices before splitting.
+            Whether to shuffle before splitting.
         batch_size
             Minibatch size for training.
         weight_decay, eps
             Optimizer hyperparameters.
-        early_stopping, save_best
-            Early stopping and checkpointing options.
+        early_stopping
+            Whether to enable early stopping.
+        early_stopping_patience
+            Number of epochs with no improvement before stopping.
+        save_best
+            Whether to save the best model checkpoint.
         check_val_every_n_epoch
-            Frequency of validation checks.
+            How often (in epochs) to run validation.
         n_steps_kl_warmup, n_epochs_kl_warmup
-            KL warmup parameters.
+            KL divergence warmup parameters (by steps or epochs).
         adversarial_mixing
-            Whether to use an adversarial classifier.
-        datasplitter_kwargs, plan_kwargs, **kwargs
-            Additional options for data splitting, training plan, and trainer.
+            Whether to include adversarial classifier during training.
+        lr_scheduler_type
+            Scheduler type in TrainingPlan: “plateau” (reduce-on-plateau) or “step” (fixed-step).
+        reduce_lr_on_plateau
+            If True and using plateau scheduler, enable ReduceLROnPlateau.
+        lr_factor
+            Multiplicative factor for LR reduction (used for both plateau and step schedulers).
+        lr_patience
+            Number of epochs with no improvement for plateau scheduler.
+        lr_threshold
+            Threshold for measuring new optimum (plateau scheduler).
+        lr_scheduler_metric
+            Metric to monitor for plateau scheduler.
+        step_size
+            Epoch interval between LR drops (step scheduler).
+        datasplitter_kwargs
+            Additional kwargs for the data splitter.
+        plan_kwargs
+            Additional kwargs to pass to the TrainingPlan constructor.
+        **kwargs
+            Additional Trainer kwargs (callbacks, strategy, etc.).
         """
+         
         update_dict = {
             "lr": lr,
-            "lr_patience": 5,
-            "adversarial_classifier": False,
+            "lr_scheduler_type": lr_scheduler_type,
+            "reduce_lr_on_plateau": reduce_lr_on_plateau, 
+            "lr_factor": lr_factor,
+            "lr_patience": lr_patience,
+            "lr_threshold": lr_threshold,
+            "lr_scheduler_metric": lr_scheduler_metric,
+            "step_size": step_size,
+            "adversarial_classifier": adversarial_mixing,
             "weight_decay": weight_decay,
             "eps": eps,
             "n_epochs_kl_warmup": n_epochs_kl_warmup,
@@ -401,7 +541,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             early_stopping=early_stopping,
             check_val_every_n_epoch=check_val_every_n_epoch,
             early_stopping_monitor="reconstruction_loss_validation",
-            early_stopping_patience=10,
+            early_stopping_patience=early_stopping_patience,
             **kwargs,
         )
         return runner()
