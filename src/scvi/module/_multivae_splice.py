@@ -756,10 +756,10 @@ class MULTIVAESPLICE(BaseModuleClass):
 
     def get_reconstruction_loss_splicing(self, x, atse_counts, junc_counts, mask, p):
         # ignore unobserved
-        if mask is not None:
-            atse_counts = atse_counts[mask]
-            junc_counts = junc_counts[mask]
-            p = p[mask]
+        # if mask is not None:
+        #     atse_counts = atse_counts[mask]
+        #     junc_counts = junc_counts[mask]
+        #     p = p[mask]
 
         # clamp once for both branches
         eps = 1e-8
@@ -772,7 +772,9 @@ class MULTIVAESPLICE(BaseModuleClass):
                 junc_counts * log_prob
             + (atse_counts - junc_counts) * log_prob_comp
             )
-            return -log_likelihood.mean()
+            if mask is not None:
+                log_likelihood = log_likelihood * mask.to(log_likelihood.dtype)
+            return -log_likelihood.sum(dim=1)
 
         elif self.splicing_loss_type == "beta_binomial":
             concentration = (
@@ -783,7 +785,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             alpha = p * concentration
             beta  = (1 - p) * concentration
 
-            log_pm = (
+            log_likelihood = (
                 torch.lgamma(atse_counts + 1)
             - torch.lgamma(junc_counts + 1)
             - torch.lgamma(atse_counts - junc_counts + 1)
@@ -794,7 +796,9 @@ class MULTIVAESPLICE(BaseModuleClass):
             - torch.lgamma(beta)
             + torch.lgamma(alpha + beta)
             )
-            return -log_pm.mean()
+            if mask is not None:
+                log_likelihood = log_likelihood * mask.to(log_likelihood.dtype)
+            return -log_likelihood.sum(dim=1)
 
         else:
             raise ValueError("splicing_loss_type must be 'binomial' or 'beta_binomial'")
