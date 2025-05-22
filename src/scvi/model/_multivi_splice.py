@@ -67,12 +67,16 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
         # keep all your existing AdversarialTrainingPlan args here…
         lr_scheduler_type: Literal["plateau", "step"] = "plateau",
         step_size: int = 10,
+        gradient_clipping: bool = True,
+        gradient_clipping_max_norm: float = 5.0,
         **kwargs,
     ):
         super().__init__(module=module, **kwargs)
         # new scheduling params
         self.lr_scheduler_type = lr_scheduler_type
         self.step_size = step_size
+        self.gradient_clipping = gradient_clipping
+        self.gradient_clipping_max_norm = gradient_clipping_max_norm
 
 
     def compute_and_log_metrics(self, loss_output, metrics, mode):
@@ -93,19 +97,36 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
                 sync_dist=self.use_sync_dist,
             )
 
-        # 3. now also log the current learning rate
-        optim = self.optimizers()
-        # if you got back multiple optimizers, pick the first
-        optim = optim[0] if isinstance(optim, list) else optim
-        # get the lr of the first param‐group
-        current_lr = optim.param_groups[0]["lr"]
-        # attach mode so you can see train_lr vs validation_lr if you like
+        try:
+            # PL’s API: self.lr_schedulers() returns a list of dicts
+            schedulers = self.lr_schedulers()
+            last_lrs = schedulers.get_last_lr()
+            current_lr = last_lrs[0] if isinstance(last_lrs, (list, tuple)) else last_lrs
+        except Exception:
+            # fallback to optimizer if scheduler isn’t available
+            optim = self.optimizers()
+            optim = optim[0] if isinstance(optim, list) else optim
+            current_lr = optim.param_groups[0]["lr"]
+
         self.log(
             f"lr_{mode}",
             current_lr,
-            on_step=True,     # logs every step
-            on_epoch=False,   # not aggregated at epoch end
+            on_step=True,    # logs every step
+            on_epoch=False,  # not aggregated at epoch end
         )
+
+    def on_validation_epoch_end(self) -> None:
+        """Update the learning rate via scheduler steps."""
+        if self.lr_scheduler_type == "step":
+            sch = self.lr_schedulers()
+            sch.step()
+            return
+        
+        if (not self.reduce_lr_on_plateau or "validation" not in self.lr_scheduler_metric):
+            return
+        else:
+            sch = self.lr_schedulers()
+            sch.step(self.trainer.callback_metrics[self.lr_scheduler_metric])
 
     def configure_optimizers(self):
         """Configure optimizers for adversarial training."""
@@ -113,6 +134,7 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
         optimizer1 = self.get_optimizer_creator()(params1)
         config1 = {"optimizer": optimizer1}
         if self.lr_scheduler_type == "step":
+            print("Using step LR")
             scheduler = StepLR(
                 optimizer1,
                 step_size=self.step_size,
@@ -128,6 +150,7 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
             )
             
         elif self.reduce_lr_on_plateau and self.lr_scheduler_type == "plateau":
+            print("Using plateau LR")
             scheduler1 = ReduceLROnPlateau(
                 optimizer1,
                 patience=self.lr_patience,
@@ -162,6 +185,52 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
                 return opts
 
         return config1
+    
+    def training_step(self, batch, batch_idx):
+        """Training step for adversarial training."""
+        if "kl_weight" in self.loss_kwargs:
+            self.loss_kwargs.update({"kl_weight": self.kl_weight})
+            self.log("kl_weight", self.kl_weight, on_step=True, on_epoch=False)
+        kappa = (
+            1 - self.kl_weight
+            if self.scale_adversarial_loss == "auto"
+            else self.scale_adversarial_loss
+        )
+        batch_tensor = batch[REGISTRY_KEYS.BATCH_KEY]
+
+        opts = self.optimizers()
+        if not isinstance(opts, list):
+            opt1 = opts
+            opt2 = None
+        else:
+            opt1, opt2 = opts
+
+        inference_outputs, _, scvi_loss = self.forward(batch, loss_kwargs=self.loss_kwargs)
+        z = inference_outputs["z"]
+        loss = scvi_loss.loss
+        # fool classifier if doing adversarial training
+        if kappa > 0 and self.adversarial_classifier is not False:
+            fool_loss = self.loss_adversarial_classifier(z, batch_tensor, False)
+            loss += fool_loss * kappa
+
+        self.log("train_loss", loss, on_epoch=True, prog_bar=True)
+        self.compute_and_log_metrics(scvi_loss, self.train_metrics, "train")
+        opt1.zero_grad()
+        self.manual_backward(loss)
+        if self.gradient_clipping:
+            torch.nn.utils.clip_grad_norm_(self.module.parameters(), max_norm=self.gradient_clipping_max_norm)
+        opt1.step()
+
+        # train adversarial classifier
+        # this condition will not be met unless self.adversarial_classifier is not False
+        if opt2 is not None:
+            loss = self.loss_adversarial_classifier(z.detach(), batch_tensor, True)
+            loss *= kappa
+            opt2.zero_grad()
+            self.manual_backward(loss)
+            if self.gradient_clipping:
+                torch.nn.utils.clip_grad_norm_(self.module.parameters(),  max_norm=self.gradient_clipping_max_norm)
+            opt2.step()
 
 
 
@@ -429,6 +498,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             "elbo_validation", "reconstruction_loss_validation", "kl_local_validation"
         ] = "elbo_validation",
         step_size: int = 10,
+        gradient_clipping: bool = True,
+        gradient_clipping_max_norm: float = 5.0,
         datasplitter_kwargs: dict | None = None,
         plan_kwargs: dict | None = None,
         **kwargs,
@@ -477,6 +548,10 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             Metric to monitor for plateau scheduler.
         step_size
             Epoch interval between LR drops (step scheduler).
+        gradient_clipping
+            Whether or not (true or false) to use gradient norm clipping
+        gradient_clipping_max_norm
+            Max norm of the gradients to be used in gradient clipping
         datasplitter_kwargs
             Additional kwargs for the data splitter.
         plan_kwargs
@@ -501,6 +576,8 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             "n_steps_kl_warmup": n_steps_kl_warmup,
             "optimizer": "AdamW",
             "scale_adversarial_loss": 1,
+            "gradient_clipping": gradient_clipping,
+            "gradient_clipping_max_norm": gradient_clipping_max_norm,
         }
         if plan_kwargs is not None:
             plan_kwargs.update(update_dict)
