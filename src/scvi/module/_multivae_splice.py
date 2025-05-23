@@ -549,13 +549,13 @@ class MULTIVAESPLICE(BaseModuleClass):
         # Combine both reconstruction losses
         recon_loss_expression = rl_expression * mask_expr
         recon_loss_splicing = rl_splicing
-        recon_loss = recon_loss_expression + recon_loss_splicing
+        GE_SCALE = 0.001
+        recon_loss =  GE_SCALE * recon_loss_expression + recon_loss_splicing
 
         # Compute KL divergence between approximate posterior and prior
         qz_m = inference_outputs["qz_m"]
         qz_v = inference_outputs["qz_v"]
         kl_div_z = kld(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
-
 
         # Compute the KL divergence for paired data, passing in the precomputed masks
         kl_div_paired = self._compute_mod_penalty(
