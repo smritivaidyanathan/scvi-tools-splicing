@@ -708,7 +708,9 @@ class MULTIVAESPLICE(BaseModuleClass):
             ).sum(dim=-1)
         
         # Combine both reconstruction losses
-        recon_loss_expression = rl_expression * mask_expr
+        GE_SCALE = 0.001
+        # print(f"Using GE_SCALE: {GE_SCALE}!")
+        recon_loss_expression = rl_expression * mask_expr * GE_SCALE
         recon_loss_splicing = rl_splicing
         recon_loss = recon_loss_expression + recon_loss_splicing
 
@@ -751,7 +753,6 @@ class MULTIVAESPLICE(BaseModuleClass):
             "kl_divergence_paired": kl_div_paired,
         }
         return LossOutput(loss=loss, reconstruction_loss=recon_losses, kl_local=kl_local)
-
 
     def get_reconstruction_loss_expression(self, x, px_rate, px_r, px_dropout):
         """Compute the reconstruction loss for gene expression data."""
