@@ -708,9 +708,9 @@ class MULTIVAESPLICE(BaseModuleClass):
             ).sum(dim=-1)
         
         # Combine both reconstruction losses
-        # GE_SCALE = 0.001
-        # print(f"Using GE_SCALE: {GE_SCALE}!")
-        recon_loss_expression = rl_expression * mask_expr #* GE_SCALE
+        GE_SCALE = 0.01
+        print(f"Using GE_SCALE: {GE_SCALE}!")
+        recon_loss_expression = rl_expression * mask_expr * GE_SCALE
         recon_loss_splicing = rl_splicing
         recon_loss = recon_loss_expression + recon_loss_splicing
 
