@@ -737,19 +737,30 @@ class MULTIVAESPLICE(BaseModuleClass):
         # )
 
         # KL WARMUP
+        # ───── KL warm-up (per-cell) ─────────────────────────────────────
         kl_local_for_warmup = kl_div_z
         weighted_kl_local = kl_weight * kl_local_for_warmup + kl_div_paired
+
+        # ───── L2 prior on log-concentrations ϕ_j (global → per-cell) ────
         lambda_prior = 1e-2                       # can tune 
-        prior_loss = lambda_prior * torch.square(self.log_phi_j).sum()
-        # prior loss here is like a L2 penalty on the log_phi_j parameters to keep them stable 
+        prior_loss = lambda_prior * torch.square(self.log_phi_j).sum() / x.size(0)  # divide by batch_size so strength is constant
 
-        # TOTAL LOSS
-        loss = torch.mean(recon_loss + weighted_kl_local + prior_loss)
+        # ───── total negative ELBO ───────────────────────────────────────
+        loss = torch.mean(recon_loss + weighted_kl_local) + prior_loss
 
+        # per cell tensors 
         recon_losses = {
             "reconstruction_loss_expression": recon_loss_expression,
-            "reconstruction_loss_splicing": recon_loss_splicing,
+            "reconstruction_loss_splicing": recon_loss_splicing
         }
+
+        # scalar diagnostics (no grads)
+        # print scalar diagnostics (no grad tracking)
+        if self.training:
+            med_phi  = generative_outputs["phi"].median().detach().item()
+            med_disp = generative_outputs["px_r"].median().detach().item()
+            print(f"[iter {self.global_step}]  median ϕ_j = {med_phi:.2f}   "
+                f"median θ_g = {med_disp:.2f}")
 
         kl_local = {
             "kl_divergence_z": kl_div_z,
