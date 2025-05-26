@@ -759,8 +759,8 @@ class MULTIVAESPLICE(BaseModuleClass):
         if self.training:
             med_phi  = generative_outputs["phi"].median().detach().item()
             med_disp = generative_outputs["px_r"].median().detach().item()
-            print(f"[iter]  median ϕ_j = {med_phi:.2f}   "
-                f"median θ_g = {med_disp:.2f}")
+            #print(f"[iter]  median ϕ_j = {med_phi:.2f}   "
+            #    f"median θ_g = {med_disp:.2f}")
 
         kl_local = {
             "kl_divergence_z": kl_div_z,
