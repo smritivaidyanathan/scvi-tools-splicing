@@ -301,6 +301,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         # ---------------- Splicing Branch ----------------
         input_spl = n_input_junctions if n_input_junctions > 0 else 1
         n_input_encoder_spl = input_spl + n_continuous_cov * int(encode_covariates)
+        self.log_phi_j = nn.Parameter(torch.randn(n_input_junctions))
 
         if (splicing_architecture=="vanilla"):
             self.z_encoder_splicing = Encoder(
@@ -619,7 +620,8 @@ class MULTIVAESPLICE(BaseModuleClass):
             px_r = self.px_r
         px_r = torch.exp(px_r)
         return {
-            "p": p_s,
+            "p": p_s, # mean psi 
+            "phi": F.softplus(self.log_phi_j),   # ϕ_j   (shape: J)
             "px_scale": px_scale,
             "px_r": torch.exp(self.px_r),
             "px_rate": px_rate,
@@ -700,7 +702,8 @@ class MULTIVAESPLICE(BaseModuleClass):
             total_counts,
             junction_counts,
             psi_mask,
-            generative_outputs["p"]
+            generative_outputs["p"],
+            generative_outputs["phi"]
         )
         else:
             rl_splicing = torch.nn.BCELoss(reduction="none")(
@@ -708,17 +711,14 @@ class MULTIVAESPLICE(BaseModuleClass):
             ).sum(dim=-1)
         
         # Combine both reconstruction losses
-        #GE_SCALE = 0.1
-        #print(f"Using GE_SCALE: {GE_SCALE}!")
-        recon_loss_expression = rl_expression * mask_expr #* GE_SCALE
+        recon_loss_expression = (rl_expression * mask_expr)
         recon_loss_splicing = rl_splicing
-        recon_loss = recon_loss_expression + recon_loss_splicing
+        recon_loss = (recon_loss_expression) + (recon_loss_splicing)
 
         # Compute KL divergence between approximate posterior and prior
         qz_m = inference_outputs["qz_m"]
         qz_v = inference_outputs["qz_v"]
         kl_div_z = kld(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
-
 
         # Compute the KL divergence for paired data, passing in the precomputed masks
         kl_div_paired = self._compute_mod_penalty(
@@ -739,9 +739,12 @@ class MULTIVAESPLICE(BaseModuleClass):
         # KL WARMUP
         kl_local_for_warmup = kl_div_z
         weighted_kl_local = kl_weight * kl_local_for_warmup + kl_div_paired
+        lambda_prior = 1e-2                       # can tune 
+        prior_loss = lambda_prior * torch.square(self.log_phi_j).sum()
+        # prior loss here is like a L2 penalty on the log_phi_j parameters to keep them stable 
 
         # TOTAL LOSS
-        loss = torch.mean(recon_loss + weighted_kl_local)
+        loss = torch.mean(recon_loss + weighted_kl_local + prior_loss)
 
         recon_losses = {
             "reconstruction_loss_expression": recon_loss_expression,
@@ -766,16 +769,16 @@ class MULTIVAESPLICE(BaseModuleClass):
             loss_val = 0.0
         return loss_val
 
-    def get_reconstruction_loss_splicing(self, x, atse_counts, junc_counts, mask, p):
-        # ignore unobserved
-        # if mask is not None:
-        #     atse_counts = atse_counts[mask]
-        #     junc_counts = junc_counts[mask]
-        #     p = p[mask]
-
-        # clamp once for both branches
+    def get_reconstruction_loss_splicing(
+            self, x, atse_counts, junc_counts, mask, p, phi):
+        """
+        x               – (N × J) binary matrix  (often unused)
+        atse_counts     – (N × J) denominator counts
+        junc_counts     – (N × J) numerator counts
+        phi             – (J)     concentration parameter *per junction*
+        """
         eps = 1e-8
-        p = p.clamp(min=eps, max=1 - eps)
+        p   = p.clamp(eps, 1 - eps)
 
         if self.splicing_loss_type == "binomial":
             log_prob      = torch.log(p)
@@ -789,13 +792,10 @@ class MULTIVAESPLICE(BaseModuleClass):
             return -log_likelihood.sum(dim=1)
 
         elif self.splicing_loss_type == "beta_binomial":
-            concentration = (
-                torch.tensor(1.0, device=p.device)
-                if self.splicing_concentration is None
-                else self.splicing_concentration
-            )
-            alpha = p * concentration
-            beta  = (1 - p) * concentration
+            # broadcast phi: (J) -> (N × J)
+            phi = phi.unsqueeze(0)          # shape (1 × J)
+            alpha = p *  phi
+            beta  = (1 - p) * phi
 
             log_likelihood = (
                 torch.lgamma(atse_counts + 1)
