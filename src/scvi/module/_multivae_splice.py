@@ -301,7 +301,9 @@ class MULTIVAESPLICE(BaseModuleClass):
         # ---------------- Splicing Branch ----------------
         input_spl = n_input_junctions if n_input_junctions > 0 else 1
         n_input_encoder_spl = input_spl + n_continuous_cov * int(encode_covariates)
-        self.log_phi_j = nn.Parameter(torch.randn(n_input_junctions))
+
+        # Initialize log_phi_j with a value of 100.0
+        self.log_phi_j = nn.Parameter(torch.full((n_input_junctions,), np.log(100.0)))
 
         if (splicing_architecture=="vanilla"):
             self.z_encoder_splicing = Encoder(
@@ -621,7 +623,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         px_r = torch.exp(px_r)
         return {
             "p": p_s, # mean psi 
-            "phi": F.softplus(self.log_phi_j),   # ϕ_j   (shape: J)
+            "phi": F.softplus(self.log_phi_j), # φ ≈ 100, with overflow protection
             "px_scale": px_scale,
             "px_r": torch.exp(self.px_r),
             "px_rate": px_rate,
@@ -756,11 +758,16 @@ class MULTIVAESPLICE(BaseModuleClass):
 
         # scalar diagnostics (no grads)
         # print scalar diagnostics (no grad tracking)
-        if self.training:
-            med_phi  = generative_outputs["phi"].median().detach().item()
-            med_disp = generative_outputs["px_r"].median().detach().item()
-            #print(f"[iter]  median ϕ_j = {med_phi:.2f}   "
-            #    f"median θ_g = {med_disp:.2f}")
+        if self.training and torch.rand(1).item() < 0.01:  # 1% of iterations
+            phi_values = generative_outputs["phi"]
+            print(f"φ stats: min={phi_values.min().item():.2f}, "
+              f"max={phi_values.max().item():.2f}, "
+              f"median={phi_values.median().item():.2f}")
+            # Check for problematic values
+            if phi_values.max() > 1000:
+                print("Large φ values detected!")
+            if phi_values.min() < 1:
+                print("Small φ values detected!")
 
         kl_local = {
             "kl_divergence_z": kl_div_z,
