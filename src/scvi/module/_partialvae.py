@@ -202,8 +202,12 @@ class PartialEncoder(nn.Module):
         h_out = self.h_layer(h_in).view(B, D, -1)    # (B, D, code_dim)
 
         # --- step 3: aggregate across features with mask ---
+        #mask_exp = mask.unsqueeze(-1).float()        # (B, D, 1)
+        #c = (h_out * mask_exp).sum(dim=1)            # (B, code_dim)
+
+        # Trying mean instead of sum
         mask_exp = mask.unsqueeze(-1).float()        # (B, D, 1)
-        c = (h_out * mask_exp).sum(dim=1)            # (B, code_dim)
+        c = (h_out * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-8)  # mean
 
         # --- step 4: now append exactly one copy of each covariate ---
         if self.inject_covariates:
