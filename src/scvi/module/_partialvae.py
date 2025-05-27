@@ -483,7 +483,7 @@ class PARTIALVAE(BaseModuleClass):
         use_batch_norm: Literal["none", "encoder", "decoder", "both"] = "both",
         use_layer_norm: Literal["none", "encoder", "decoder", "both"] = "none",
         extra_payload_autotune: bool = False,
-        code_dim: int = 32,
+        code_dim: int = 16,
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
         learn_concentration: bool = True,

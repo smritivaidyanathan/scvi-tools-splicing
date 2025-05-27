@@ -185,7 +185,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         dropout_rate: float = 0.1,
         splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
         expression_architecture: Literal["vanilla", "linear"] = "vanilla",
-        code_dim: int = 32,
+        code_dim: int = 16,
         h_hidden_dim: int = 64,
         mlp_encoder_hidden_dim: int = 128,
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "none",
@@ -303,7 +303,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         n_input_encoder_spl = input_spl + n_continuous_cov * int(encode_covariates)
 
         # Initialize log_phi_j with a value of 100.0
-        self.log_phi_j = nn.Parameter(torch.full((n_input_junctions,), np.log(100.0)))
+        self.log_phi_j = nn.Parameter(torch.randn(n_input_junctions) * 0.5 + np.log(100.0))
 
         if (splicing_architecture=="vanilla"):
             self.z_encoder_splicing = Encoder(
@@ -687,7 +687,6 @@ class MULTIVAESPLICE(BaseModuleClass):
         mask_expr = x_expr.sum(dim=1) > 0
         mask_spl = x_spl.sum(dim=1) > -10000000
     
-
         # Compute Expression loss
         px_rate = generative_outputs["px_rate"]
         px_r = generative_outputs["px_r"]
@@ -698,8 +697,8 @@ class MULTIVAESPLICE(BaseModuleClass):
         )
         
         # Compute splicing reconstruction loss
-        if total_counts is not None and junction_counts is not None:
-            rl_splicing = self.get_reconstruction_loss_splicing(
+        # removed else statement
+        rl_splicing = self.get_reconstruction_loss_splicing(
             x_spl,
             total_counts,
             junction_counts,
@@ -707,10 +706,6 @@ class MULTIVAESPLICE(BaseModuleClass):
             generative_outputs["p"],
             generative_outputs["phi"]
         )
-        else:
-            rl_splicing = torch.nn.BCELoss(reduction="none")(
-                generative_outputs["p"], (x_spl > 0).float()
-            ).sum(dim=-1)
         
         # Combine both reconstruction losses
         recon_loss_expression = (rl_expression * mask_expr)
@@ -760,14 +755,20 @@ class MULTIVAESPLICE(BaseModuleClass):
         # print scalar diagnostics (no grad tracking)
         if self.training and torch.rand(1).item() < 0.01:  # 1% of iterations
             phi_values = generative_outputs["phi"]
+            gene_dispersion = generative_outputs["px_r"]  # Gene concentration parameters
             print(f"φ stats: min={phi_values.min().item():.2f}, "
               f"max={phi_values.max().item():.2f}, "
               f"median={phi_values.median().item():.2f}")
-            # Check for problematic values
-            if phi_values.max() > 1000:
-                print("Large φ values detected!")
-            if phi_values.min() < 1:
-                print("Small φ values detected!")
+
+            print(f"θ_g (gene disp):     min={gene_dispersion.min().item():.2f}, "
+              f"max={gene_dispersion.max().item():.2f}, "
+              f"median={gene_dispersion.median().item():.2f}")
+    
+            # Compare them
+            phi_median = phi_values.median().item()
+            gene_median = gene_dispersion.median().item()
+            ratio = phi_median / gene_median if gene_median > 0 else float('inf')
+            print(f"φ_j/θ_g ratio: {ratio:.2f}")
 
         kl_local = {
             "kl_divergence_z": kl_div_z,
