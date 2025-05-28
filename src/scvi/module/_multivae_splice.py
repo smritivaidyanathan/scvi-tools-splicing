@@ -303,9 +303,9 @@ class MULTIVAESPLICE(BaseModuleClass):
         n_input_encoder_spl = input_spl + n_continuous_cov * int(encode_covariates)
 
         # Initialize log_phi_j with a value of 100.0
-        if self.splicing_loss_type == "beta_binomial":
-            self.log_phi_j = nn.Parameter(torch.randn(n_input_junctions) * 0.5 + np.log(100.0))
-        else:
+        self.log_phi_j = nn.Parameter(torch.randn(n_input_junctions) * 0.5 + np.log(100.0))
+        
+        if not self.splicing_loss_type == "beta_binomial":
             # turn off grads so optimizer ignores φ if not beta binomial loss
             print("Not in beta_binomial, turning off gradient for log_phi.")
             self.log_phi_j.requires_grad_(False)
