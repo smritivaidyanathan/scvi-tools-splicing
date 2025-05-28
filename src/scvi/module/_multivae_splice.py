@@ -303,7 +303,12 @@ class MULTIVAESPLICE(BaseModuleClass):
         n_input_encoder_spl = input_spl + n_continuous_cov * int(encode_covariates)
 
         # Initialize log_phi_j with a value of 100.0
-        self.log_phi_j = nn.Parameter(torch.randn(n_input_junctions) * 0.5 + np.log(100.0))
+        if self.splicing_loss_type == "beta_binomial":
+            self.log_phi_j = nn.Parameter(torch.randn(n_input_junctions) * 0.5 + np.log(100.0))
+        else:
+            # turn off grads so optimizer ignores φ if not beta binomial loss
+            print("Not in beta_binomial, turning off gradient for log_phi.")
+            self.log_phi_j.requires_grad_(False)
 
         if (splicing_architecture=="vanilla"):
             self.z_encoder_splicing = Encoder(
@@ -740,7 +745,12 @@ class MULTIVAESPLICE(BaseModuleClass):
 
         # ───── L2 prior on log-concentrations ϕ_j (global → per-cell) ────
         lambda_prior = 1e-2                       # can tune 
-        prior_loss = lambda_prior * torch.square(self.log_phi_j).sum() / x.size(0)  # divide by batch_size so strength is constant
+
+        if self.splicing_loss_type == "beta_binomial":
+            prior_loss = lambda_prior * torch.square(self.log_phi_j).sum() / x.size(0)  # divide by batch_size so strength is constant
+        else:
+            prior_loss = 0.0 #do not compute prior loss if we're not using beta_binomial distribution
+        
 
         # ───── total negative ELBO ───────────────────────────────────────
         loss = torch.mean(recon_loss + weighted_kl_local) + prior_loss
