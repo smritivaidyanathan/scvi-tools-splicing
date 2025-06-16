@@ -60,7 +60,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     dropout_rate
         Dropout probability.
     learn_concentration
-        Whether to learn Beta-Binomial concentration.
+        Whether to learn Beta-Binomial or Dirichlet Multinomial concentration.
     encode_covariates
         If True, concatenates obs‐level covariates to each encoder/decoder input.
     deeply_inject_covariates
@@ -78,7 +78,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         latent_dim: int = 10,
         dropout_rate: float = 0.1, 
         learn_concentration: bool = True,
-        splice_likelihood: Literal["binomial", "beta_binomial"] = "beta_binomial",
+        splice_likelihood: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
         encode_covariates: bool = False,
         deeply_inject_covariates: bool = True,
         initialize_embeddings_from_pca: bool = True,
@@ -146,12 +146,35 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 **self._module_kwargs,
             )
 
-            if self.adata is not None and initialize_embeddings_from_pca:
-                self.init_feature_embedding_from_adata()
+            if self.adata is not None:
+                if initialize_embeddings_from_pca:
+                    self.init_feature_embedding_from_adata()
+                if splice_likelihood == "dirichlet_multinomial":
+                    self.init_junc2atse()
 
         self.init_params_ = self._get_init_params(locals())
 
-    
+    def make_junc2atse(self, atse_labels):
+        print("Making Junc2Atse...")
+        num_junctions = len(atse_labels)
+        atse_labels = atse_labels.astype('category')
+        row_indices = torch.arange(num_junctions, dtype=torch.long)
+        col_indices = torch.tensor(atse_labels.cat.codes.values)
+
+        return torch.sparse_coo_tensor(
+            indices=torch.stack([row_indices, col_indices]),
+            values=torch.ones(len(row_indices), dtype=torch.float32),
+            size=(num_junctions, len(atse_labels.cat.categories))
+        ).coalesce()
+
+    def init_junc2atse(self) -> None:
+        clus_layer = self.adata_manager.data_registry["cluster_counts"].attr_key
+        cluster_counts = self.adata.layers[clus_layer]
+        atse_labels = self.adata.var["event_id"]
+        j2a = self.make_junc2atse(atse_labels)
+        self.module.junc2atse = j2a.coalesce().to(self.module.device)
+
+
     def init_feature_embedding_from_adata(self) -> None:
         """
         Center the `junc_ratio` layer, run PCA on it, and copy
@@ -160,6 +183,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
 
         from sklearn.decomposition import PCA
         import scipy.sparse as sp
+        print("Initializing Feature Embeddings from Adata...")
     
         # 1) figure out which layer was registered as X_KEY
         layer = self.adata_manager.data_registry[REGISTRY_KEYS.X_KEY].attr_key
@@ -181,6 +205,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             self.module.encoder.feature_embedding.copy_(
                 torch.as_tensor(comps, dtype=self.module.encoder.feature_embedding.dtype)
             )
+        print("Initialized Feature Embeddings.")
     
     @devices_dsp.dedent
     def train(

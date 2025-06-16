@@ -326,7 +326,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         n_layers_decoder: int = 2,
         dropout_rate: float = 0.1,
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
-        splicing_loss_type: Literal["binomial", "beta_binomial"] = "beta_binomial",
+        splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
         splicing_concentration: float | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
@@ -413,8 +413,32 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         self.n_junctions = n_junctions
         self.get_normalized_function_name = "get_normalized_splicing"
 
-        if self.adata is not None and initialize_embeddings_from_pca and splicing_architecture == "partial":
-                self.init_feature_embedding_from_adata()
+        if self.adata is not None:
+                if initialize_embeddings_from_pca and splicing_architecture == "partial":
+                    self.init_feature_embedding_from_adata()
+                if splicing_loss_type == "dirichlet_multinomial":
+                    self.init_junc2atse()
+
+    def make_junc2atse(self, atse_labels):
+        print("Making Junc2Atse...")
+        num_junctions = len(atse_labels)
+        atse_labels = atse_labels.astype('category')
+        row_indices = torch.arange(num_junctions, dtype=torch.long)
+        col_indices = torch.tensor(atse_labels.cat.codes.values)
+
+        return torch.sparse_coo_tensor(
+            indices=torch.stack([row_indices, col_indices]),
+            values=torch.ones(len(row_indices), dtype=torch.float32),
+            size=(num_junctions, len(atse_labels.cat.categories))
+        ).coalesce()
+
+    def init_junc2atse(self) -> None:
+        cl_info = self.adata_manager.data_registry["cluster_counts"]
+        cl_key, mod_key = cl_info.attr_key, cl_info.mod_key
+        cluster_counts = self.adata[mod_key].layers[cl_key]
+        atse_labels = self.adata.var["event_id"]
+        j2a = self.make_junc2atse(atse_labels)
+        self.module.junc2atse = j2a.coalesce().to(self.module.device)
 
     def init_feature_embedding_from_adata(self) -> None:
         """

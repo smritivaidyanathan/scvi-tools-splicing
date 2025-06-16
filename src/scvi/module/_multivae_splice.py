@@ -12,7 +12,7 @@ from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial, NegativeBinomialMixture, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers, LinearDecoderSCVI
-from scvi.module._partialvae import PartialEncoder, LinearDecoder
+from scvi.module._partialvae import PartialEncoder, LinearDecoder, group_logsumexp, subtract_group_logsumexp, dirichlet_multinomial_likelihood
 
 from ._utils import masked_softmax
 
@@ -153,7 +153,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         Whether to provide covariates to the encoders.
     use_size_factor_key : bool, default False
         Whether to use a size-factor field for gene expression.
-    splicing_loss_type : Literal["binomial", "beta_binomial"], default "beta_binomial"
+    splicing_loss_type : Literal["binomial", "beta_binomial", "dirichlet_multinomial"], default "beta_binomial"
         Loss type used for splicing reconstruction.
     splicing_concentration : float or None, default None
         Concentration parameter used for the beta-binomial loss (if applicable).
@@ -194,7 +194,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         deeply_inject_covariates: bool = False,
         encode_covariates: bool = False,
         use_size_factor_key: bool = False,
-        splicing_loss_type: Literal["binomial", "beta_binomial"] = "beta_binomial",
+        splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
         splicing_concentration: float | None = None,
         **model_kwargs,
     ):
@@ -308,7 +308,10 @@ class MULTIVAESPLICE(BaseModuleClass):
         if not self.splicing_loss_type == "beta_binomial":
             # turn off grads so optimizer ignores φ if not beta binomial loss
             print("Not in beta_binomial, turning off gradient for log_phi.")
+            if self.splicing_loss_type == "dirichlet_multinomial":
+                self.log_phi_j = torch.tensor(10.0)
             self.log_phi_j.requires_grad_(False)
+        
 
         if (splicing_architecture=="vanilla"):
             self.z_encoder_splicing = Encoder(
@@ -641,7 +644,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         latent KL divergence, and the modality alignment penalty.
 
         For splicing, if count data is provided (via the keys "atse_counts_key" and "junc_counts_key"),
-        the loss is computed using the specified binomial or beta-binomial likelihood; otherwise, binary
+        the loss is computed using the specified binomial, DM, or beta-binomial likelihood; otherwise, binary
         cross-entropy is used.
 
         Returns
@@ -840,9 +843,35 @@ class MULTIVAESPLICE(BaseModuleClass):
             if mask is not None:
                 log_likelihood = log_likelihood * mask.to(log_likelihood.dtype)
             return -log_likelihood.sum(dim=1)
+        
+        elif self.splicing_loss_type == "dirichlet_multinomial":
+            # 1) invert sigmoid to get raw logits
+            logits = torch.log(p) - torch.log1p(-p)
 
+            # 2) group‐softmax on each ATSE
+            lse = group_logsumexp(self.junc2atse, logits)            # → (N, G)
+            sm_logits = subtract_group_logsumexp(
+                self.junc2atse, logits, lse
+            )                                                       # → (N, J)
+
+            # 3) build α = concentration × exp(softmax_logits)
+            #    you can pull this from self.splicing_concentration or default to 10.0
+            conc = getattr(self, "splicing_concentration", 10.0) or 10.0
+            α = conc * torch.exp(sm_logits)
+
+            # 4) feed into our DM‐likelihood helper
+            ll = dirichlet_multinomial_likelihood(
+                counts=junc_counts,
+                atse_counts=atse_counts,
+                junc2atse=self.junc2atse,
+                alpha=α,
+            )
+            # ll is the *mean* log‐likelihood per cell, so -ll is your loss
+            return -ll
+        
         else:
-            raise ValueError("splicing_loss_type must be 'binomial' or 'beta_binomial'")
+            raise ValueError("`splicing_loss_type` must be one of "
+                         "'binomial', 'beta_binomial' or 'dirichlet_multinomial'")
 
 
 

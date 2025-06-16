@@ -24,6 +24,97 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+from torch.special import gammaln
+
+def group_logsumexp(A, B):
+    """
+    Computes the log-sum-exp of B, grouped by A.
+    A is a sparse matrix (must be coalesced already!) with shape (P, G), where P is the number of variables (junctions)
+    and G is the number of groups (ATSEs). B is a dense matrix with shape (N, P), where
+    N is the number of samples (cells). The result is a dense matrix with shape (N, G).
+    """
+    idx_p, idx_g = A.indices()              # (2, P), since each var belongs to one group
+    idx_p = idx_p.to(B.device)
+    idx_g = idx_g.to(B.device)
+
+    N, P = B.shape
+    G = A.shape[1]
+
+    # (N, P) → gather relevant group index for each variable
+    group_idx = torch.empty(P, dtype=torch.long, device=B.device)
+    group_idx[idx_p] = idx_g
+
+    # Get max within each group
+    max_B = torch.full((N, G), float('-inf'), device=B.device)
+    max_B.scatter_reduce_(1, group_idx.expand(N, -1), B, reduce='amax')
+
+    # Center B by group max
+    B_centered = B - max_B.gather(1, group_idx.expand(N, -1))
+
+    exp_B_centered = torch.exp(B_centered)
+
+    # Sum exp over each group
+    sum_exp = torch.zeros((N, G), device=B.device)
+    sum_exp.scatter_add_(1, group_idx.expand(N, -1), exp_B_centered)
+
+    return torch.log(sum_exp + 1e-8) + max_B
+
+def subtract_group_logsumexp(A, B, group_logsumexp):
+    """
+    Subtracts the group log-sum-exp from each element in B, grouped by A.
+    A is a sparse matrix (must be coalesced already!) with shape (P, G), where P is the number of variables (junctions)
+    and G is the number of groups (ATSEs). B is a dense matrix with shape (N, P), where
+    N is the number of samples (cells). The result is a dense matrix with shape (N, P).
+    """
+    idx_p, idx_g = A.indices()
+    idx_g = idx_g.to(B.device)
+    N = B.size(0)
+    return B - group_logsumexp[:, idx_g]
+
+def nbetaln(count, alpha):  
+    """
+    Computes log(count * beta(count, alpha)) == gammaln(count + 1) + gammaln(alpha) - gammaln(count + alpha). 
+    Note this is zero when count == 0, which could potentially be used to improve efficiency.
+    """
+    return gammaln(alpha) + gammaln(count+1.) - gammaln(alpha + count)
+
+def dirichlet_multinomial_likelihood(counts, atse_counts, junc2atse, alpha): 
+    """
+    Computes the log likelihood of the Dirichlet multinomial model.
+    counts: (N, P) matrix of counts
+    atse_counts: (N, G) matrix of counts for each ATSE (G is number of ATSEs)
+    junc2atse: (P, G) sparse matrix of ATSE assignments
+    alpha: (N, P) vector of Dirichlet parameters
+    """
+
+    idx_p, idx_g = junc2atse.indices()      # maps each junction p → group g
+    idx_p = idx_p.to(counts.device)
+    idx_g = idx_g.to(counts.device)
+    device = counts.device
+    junc2atse = junc2atse.to(device)
+    alpha = alpha.to(device)
+
+    N, P = counts.shape
+    G = junc2atse.shape[1]
+
+    true_atse = torch.zeros((N, G), 
+                           dtype=atse_counts.dtype, 
+                        device=counts.device)
+    # for each junction p we scatter its repeated atse_counts into column g = idx_g[p]
+    # since they're all identical within a group, amax just picks that constant
+    true_atse.scatter_reduce_(
+        dim=1,
+        index=idx_g.expand(N, -1),    # shape (N, P)
+        src=atse_counts,               # shape (N, P)
+        reduce="amax"
+    )
+
+    atse_counts = true_atse
+    alpha_sums = (alpha @ junc2atse)
+    per_atse = nbetaln(atse_counts, alpha_sums).sum(dim=1).mean()  # sum over ATSEs, mean over cells
+    per_junc = nbetaln(counts,alpha).sum(dim=1).mean()  # sum over ATSEs, mean over cells
+    return per_atse - per_junc
+
 
 def binomial_loss_function(
     logits: torch.Tensor,
@@ -230,8 +321,8 @@ class PartialEncoder(nn.Module):
 
         # apply the transformer layer
         # output shape is (B, D, code_dim)
-        tr_out = self.transformer_layer(h_out, src_key_padding_mask=padding_mask)
-
+        #tr_out = self.transformer_layer(h_out, src_key_padding_mask=padding_mask)
+        tr_out = h_out
         # now pool across the D dimension (e.g. simple masked mean again)
         mask_exp = mask.unsqueeze(-1).float()                 # (B, D, 1)
         c = (tr_out * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-8)
@@ -456,7 +547,7 @@ class PARTIALVAE(BaseModuleClass):
         (e.g. `[n_batch] + other_cats`).
     dropout_rate : float
         Dropout rate applied in encoder/decoder.
-    splice_likelihood : {"binomial","beta_binomial"}
+    splice_likelihood : {"binomial","beta_binomial", "dirichlet_multinomial"}
         Which reconstruction loss to use.
     latent_distribution : {"normal","ln"}
         Latent prior type.
@@ -526,9 +617,10 @@ class PARTIALVAE(BaseModuleClass):
         cat_list = [n_batch] + list(n_cats_per_cov) if n_cats_per_cov is not None else []
         encoder_cat_list = cat_list if encode_covariates else None
 
-        # Beta‐Binomial concentration parameter
+        # ——— shared concentration parameter ϕ ———
+        # initialize to log(100) ≈ 4.6
         if learn_concentration:
-            self.log_concentration = nn.Parameter(torch.tensor(0.0))
+            self.log_concentration = nn.Parameter(torch.tensor(4.6))
         else:
             self.log_concentration = None
 
@@ -555,28 +647,6 @@ class PARTIALVAE(BaseModuleClass):
             n_cat_list=cat_list,
             n_cont=n_continuous_cov,
         )
-
-
-
-
-
-    def initialize_feature_embedding_from_pca(self, pca_components: np.ndarray):
-
-        """
-        Inject PCA components into feature embedding of PartialEncoder.
-        """
-
-        if not isinstance(pca_components, np.ndarray):
-            raise TypeError("pca_components must be a numpy array.")
-    
-        assert pca_components.shape == (self.input_dim, self.encoder.code_dim), \
-            f"PCA shape {pca_components.shape} does not match model ({self.input_dim}, {self.encoder.code_dim})"
-
-        with torch.no_grad():
-            self.encoder.feature_embedding.copy_(
-                torch.tensor(pca_components, dtype=self.encoder.feature_embedding.dtype)
-            )
-
 
     @auto_move_data
     def _get_inference_input(self, tensors):
@@ -682,7 +752,7 @@ class PARTIALVAE(BaseModuleClass):
         # finally call your decoder, passing batch_index first:
         reconstruction = self.decoder(decoder_input, batch_index, *cat_list, cont=cont_covs)
 
-        return {"reconstruction": reconstruction}
+        return {"reconstruction": reconstruction}   # now shape (J,)
 
 
 
@@ -710,7 +780,8 @@ class PARTIALVAE(BaseModuleClass):
                 k=x.shape[0],
                 mask=mask,
             )
-        else:
+
+        elif self.splice_likelihood == "beta_binomial":
             concentration = torch.exp(self.log_concentration)
             reconst = beta_binomial_loss_function(
                 logits=p,
@@ -721,6 +792,47 @@ class PARTIALVAE(BaseModuleClass):
                 concentration=concentration,
                 mask=mask,
             )
+
+        elif self.splice_likelihood == "dirichlet_multinomial":
+            # --- prepare inputs ---
+            # junc:        (B,D)  = counts per junction per cell
+            # clus:        (B,D)  = repeated ATSE totals per junction per cell
+            # self.junc2atse: sparse (D, G)
+
+            # decoder output p is currently a “logit” tensor of shape (B,D)
+            logits = p
+
+            # we need atse_counts of shape (B, D), which you already have in `clus`.
+            atse_counts = clus
+
+            # concentration scalar fixed at 10.0 for now
+            
+            concentration = torch.exp(self.log_concentration)
+            print(f"[DM ϕ] concentration = {concentration.item():.4f}")
+
+            # --- turn logits into per‐group softmax‐logits ---
+            # group_logsumexp and subtract_group_logsumexp expect (N,P)→(N,G)
+            lse = group_logsumexp(self.junc2atse, logits)            # → (N,G)
+            softmax_logits = subtract_group_logsumexp(
+                self.junc2atse, logits, lse
+            )                                                           # → (N,P)
+
+            # build alpha = conc * exp(softmax_logits)
+            alpha = concentration * torch.exp(softmax_logits)
+
+            # compute the DM log‐likelihood
+            ll = dirichlet_multinomial_likelihood(
+                counts=junc,
+                atse_counts=atse_counts,
+                junc2atse=self.junc2atse,
+                alpha=alpha,
+            )
+            # negative mean‐log‐lik
+            reconst = -ll
+
+        else:
+            raise ValueError(f"Unknown splice_likelihood={self.splice_likelihood}")
+
         # reconst is a scalar: -E_q [ log p(x|z) ]
 
         # 3) KL divergence
