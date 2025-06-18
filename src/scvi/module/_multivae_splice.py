@@ -12,7 +12,7 @@ from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial, NegativeBinomialMixture, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers, LinearDecoderSCVI
-from scvi.module._partialvae import PartialEncoder, LinearDecoder, group_logsumexp, subtract_group_logsumexp, dirichlet_multinomial_likelihood
+from scvi.module._partialvae import PartialEncoder, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
 
 from ._utils import masked_softmax
 
@@ -309,7 +309,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             # turn off grads so optimizer ignores φ if not beta binomial loss
             print("Not in beta_binomial, turning off gradient for log_phi.")
             if self.splicing_loss_type == "dirichlet_multinomial":
-                self.log_phi_j = torch.tensor(10.0)
+                self.log_phi_j = nn.Parameter(torch.tensor(4.6))
             self.log_phi_j.requires_grad_(False)
         
 
@@ -800,6 +800,67 @@ class MULTIVAESPLICE(BaseModuleClass):
         else:
             loss_val = 0.0
         return loss_val
+        
+
+    def dirichlet_multinomial_likelihood(
+        self,
+        counts: torch.Tensor,           # (N, P)
+        atse_counts: torch.Tensor,      # (N, G)
+        junc2atse: torch.sparse.Tensor, # (P, G)
+        alpha: torch.Tensor,            # (N, P)
+        mask: torch.Tensor | None = None,  # optional (N, P)
+    ) -> torch.Tensor:
+        """
+        Computes each cell’s Dirichlet–multinomial log-likelihood,
+        **masking out** any junctions where mask==0 and any ATSE-groups where atse_counts==0.
+
+        Returns:
+            Tensor of shape (N,) giving per-cell log-likelihood:
+                ll[i] = sum_over_groups LL_group(i,g)  –  sum_over_junctions LL_junc(i,p)
+        """
+        # 0) ensure everything on the same device
+        device      = counts.device
+        counts      = counts.to(device)
+        atse_counts = atse_counts.to(device)
+        alpha       = alpha.to(device)
+        mask        = mask.to(device) if mask is not None else None
+        junc2atse   = junc2atse.to(device)
+
+        N, P = counts.shape
+        G     = junc2atse.shape[1]
+
+        # 1) build true per-cell ATSE_counts → (N, G)
+        idx_p, idx_g = junc2atse.indices()  # each ≈ P long
+        idx_g = idx_g.to(device)
+        true_atse = torch.zeros((N, G), device=device, dtype=atse_counts.dtype)
+        true_atse.scatter_reduce_(
+            dim=1,
+            index=idx_g.expand(N, -1),  # (N, P)
+            src=atse_counts,            # (N, P)
+            reduce="amax",
+        )
+        atse_counts = true_atse       # now (N, G)
+
+        # 2) αₛ = sum_p α_p within each group → (N, G)
+        alpha_sums = alpha @ junc2atse  # (N, G)
+
+        # 3) per-group log-likelihood → (N, G)
+        ll_atse = nbetaln(atse_counts, alpha_sums)
+        # mask out any groups with zero denominator
+        ll_atse = ll_atse * (atse_counts > 0).to(ll_atse.dtype)
+        per_cell_atse = ll_atse.sum(dim=1)  # (N,)
+
+        # 4) per-junction log-likelihood → (N, P)
+        ll_junc = nbetaln(counts, alpha)
+        if mask is not None:
+            ll_junc = ll_junc * mask.to(ll_junc.dtype)
+        per_cell_junc = ll_junc.sum(dim=1)  # (N,)
+
+        # 5) return per-cell difference (no batch average)
+        return per_cell_atse - per_cell_junc  # (N,)
+
+
+
 
     def get_reconstruction_loss_splicing(
             self, x, atse_counts, junc_counts, mask, p, phi):
@@ -856,17 +917,18 @@ class MULTIVAESPLICE(BaseModuleClass):
 
             # 3) build α = concentration × exp(softmax_logits)
             #    you can pull this from self.splicing_concentration or default to 10.0
-            conc = getattr(self, "splicing_concentration", 10.0) or 10.0
-            α = conc * torch.exp(sm_logits)
+            conc = 10.0
+            alpha = conc * torch.exp(sm_logits)
 
             # 4) feed into our DM‐likelihood helper
-            ll = dirichlet_multinomial_likelihood(
+            ll = self.dirichlet_multinomial_likelihood(
                 counts=junc_counts,
                 atse_counts=atse_counts,
                 junc2atse=self.junc2atse,
-                alpha=α,
+                alpha=alpha,
+                mask=mask, #internally sums over all atses and junctions
             )
-            # ll is the *mean* log‐likelihood per cell, so -ll is your loss
+            # ll is the log‐likelihood per cell, so -ll is your loss
             return -ll
         
         else:

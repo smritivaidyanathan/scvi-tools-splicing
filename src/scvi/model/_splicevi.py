@@ -151,6 +151,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                     self.init_feature_embedding_from_adata()
                 if splice_likelihood == "dirichlet_multinomial":
                     self.init_junc2atse()
+                self.module.num_junctions=len(self.adata.var)
 
         self.init_params_ = self._get_init_params(locals())
 

@@ -78,42 +78,67 @@ def nbetaln(count, alpha):
     """
     return gammaln(alpha) + gammaln(count+1.) - gammaln(alpha + count)
 
-def dirichlet_multinomial_likelihood(counts, atse_counts, junc2atse, alpha): 
+def dirichlet_multinomial_likelihood(
+    counts: torch.Tensor,        # (N, P)
+    atse_counts: torch.Tensor,   # (N, G)
+    junc2atse: torch.sparse.Tensor,  # (P, G)
+    alpha: torch.Tensor,         # (N, P)
+    mask: torch.Tensor | None = None,  # optional (N, P)
+) -> torch.Tensor:
     """
-    Computes the log likelihood of the Dirichlet multinomial model.
-    counts: (N, P) matrix of counts
-    atse_counts: (N, G) matrix of counts for each ATSE (G is number of ATSEs)
-    junc2atse: (P, G) sparse matrix of ATSE assignments
-    alpha: (N, P) vector of Dirichlet parameters
-    """
+    Computes the batch-averaged Dirichlet–multinomial log-likelihood,
+    **masking out** any junctions where mask==0 and any ATSEs where atse_counts==0.
 
-    idx_p, idx_g = junc2atse.indices()      # maps each junction p → group g
+    Returns:
+        scalar = mean_over_cells( sum_per_ATSE(LL_atse * ATSE_mask)
+                                - sum_per_junction(LL_junc * junc_mask) )
+    """
+    device = counts.device
+    atse_counts = atse_counts.to(device)
+    alpha       = alpha.to(device)
+    mask        = mask.to(device) if mask is not None else None
+    junc2atse   = junc2atse.to(device)
+    N, P = counts.shape
+    G     = junc2atse.shape[1]
+
+    idx_p, idx_g = junc2atse.indices()
     idx_p = idx_p.to(counts.device)
     idx_g = idx_g.to(counts.device)
-    device = counts.device
-    junc2atse = junc2atse.to(device)
-    alpha = alpha.to(device)
+    idx_p, idx_g = junc2atse.indices()
+    idx_p = idx_p.to(device)
+    idx_g = idx_g.to(device)             # each length ≈ P
 
-    N, P = counts.shape
-    G = junc2atse.shape[1]
-
-    true_atse = torch.zeros((N, G), 
-                           dtype=atse_counts.dtype, 
-                        device=counts.device)
-    # for each junction p we scatter its repeated atse_counts into column g = idx_g[p]
-    # since they're all identical within a group, amax just picks that constant
+    true_atse = torch.zeros((N, G), device=device, dtype=atse_counts.dtype)
     true_atse.scatter_reduce_(
         dim=1,
-        index=idx_g.expand(N, -1),    # shape (N, P)
-        src=atse_counts,               # shape (N, P)
-        reduce="amax"
+        index=idx_g.expand(N, -1),                    # (N, P)
+        src=atse_counts,                              # (N, P)
+        reduce="amax",
     )
+    atse_counts = true_atse                           # (N, G)
 
-    atse_counts = true_atse
-    alpha_sums = (alpha @ junc2atse)
-    per_atse = nbetaln(atse_counts, alpha_sums).sum(dim=1).mean()  # sum over ATSEs, mean over cells
-    per_junc = nbetaln(counts,alpha).sum(dim=1).mean()  # sum over ATSEs, mean over cells
+    # 2) compute group-sums of alpha → (N, G)
+    alpha_sums = alpha @ junc2atse                    # (N, G)
+
+    # 3) per-ATSE log-likelihoods
+    ll_atse = nbetaln(atse_counts, alpha_sums)        # (N, G)
+    # mask out any ATSEs with zero count
+    atse_mask = (atse_counts > 0).to(ll_atse.dtype)   # (N, G)
+    ll_atse = ll_atse * atse_mask                     # zeros where atse_count==0
+    # sum per ATSE and then average over cells
+    per_atse = ll_atse.sum(dim=1).mean()              # scalar
+
+    # 4) per-junction log-likelihoods
+    ll_junc = nbetaln(counts, alpha)                  # (N, P)
+    if mask is not None:
+        mask_bool = mask.to(torch.bool)               # (N, P)
+        ll_junc = ll_junc * mask_bool.to(ll_junc.dtype)
+    # sum per junction and then average over cells
+    per_junc = ll_junc.sum(dim=1).mean()              # scalar
+
+    # 5) return batch-averaged difference
     return per_atse - per_junc
+
 
 
 def binomial_loss_function(
@@ -218,6 +243,153 @@ def beta_binomial_loss_function(
     log_lik = log_lik #* (float(n) / float(k))
     return -log_lik.mean()
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+from typing import Optional
+
+class LinformerSelfAttention(nn.Module):
+    """
+    A lean version of self-attention: we squish the keys and values
+    down to a smaller dimension k before doing dot-product attention.
+    This is the core trick from the Linformer paper (Wang et al. 2020):
+    "We show that self-attention can be projected onto a low-rank
+    subspace, reducing the complexity from O(n^2) to O(nk)."
+    Eq. (5) in the paper: Approx softmax(Q K^T / sqrt(d)) V
+    but with K, V replaced by E X and F X.
+    """
+    def __init__(self, embed_dim: int, num_heads: int, k: int, max_seq_len: int):
+        super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        # scaling factor 1/sqrt(d)
+        self.scale = self.head_dim ** -0.5
+
+        # standard linear projections for Q, K, V
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        # These are the low-rank projection matrices (E for keys, F for values).
+        # We learn E, F of shape (k, embed_dim), so seq_len D -> k.
+        self.E_proj = nn.Linear(max_seq_len, k, bias=False)
+        self.F_proj = nn.Linear(max_seq_len, k, bias=False)
+        self.max_seq_len = max_seq_len
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """
+        x: (B, D, C) where D = sequence length, C = embed_dim
+        mask: (B, D) with True for positions to keep
+        """
+        B, D, C = x.shape
+
+        if D != self.max_seq_len:
+            raise RuntimeError(f"Expected sequence length {self.max_seq_len}, got {D}")
+
+        # 1) project inputs to queries, keys, values
+        q = self.q_proj(x)  # (B, D, C)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # 2) split into heads: shape (B, h, D, head_dim)
+        def split_heads(t):
+            return t.view(B, D, self.num_heads, self.head_dim)\
+                    .transpose(1, 2)
+        q, k, v = map(split_heads, (q, k, v))
+
+        # 3) Linformer trick: project seq_len D down to k for k & v
+        #    flatten batch & heads -> (B*h, D, head_dim)
+        Bh = B * self.num_heads
+        k = k.reshape(Bh, D, self.head_dim)
+        v = v.reshape(Bh, D, self.head_dim)
+        # project seq-axis D→k via E_proj, F_proj
+        # k,v are (B*h, D, head_dim) → transpose to (B*h, head_dim, D)
+        k = self.E_proj(k.transpose(1,2)).transpose(1,2)  # → (B*h, k, head_dim)
+        v = self.F_proj(v.transpose(1,2)).transpose(1,2)
+
+        # 4) reshape q similarly for matmul: (B*h, D, head_dim)
+        q = q.reshape(Bh, D, self.head_dim)
+
+        # 5) compute scaled dot-product attention
+        #    eq: A = softmax( Q K^T / sqrt(d) )
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (Bh, D, k)
+        if mask is not None:
+            # mask: True means keep, False means pad
+            # expand mask to (Bh, D, k)
+            m = mask.unsqueeze(1).repeat(1, self.num_heads, 1)  # (B, h, D)
+            m = m.reshape(Bh, D).unsqueeze(-1).expand(-1, -1, k.size(1))
+            attn_scores = attn_scores.masked_fill(~m, float('-inf'))
+        attn = F.softmax(attn_scores, dim=-1)
+        # replace any NaNs (from all-masked rows) with zeros
+        attn = torch.nan_to_num(attn, nan=0.0)
+
+        # 6) weighted sum: (Bh, D, k) x (Bh, k, head_dim) -> (Bh, D, head_dim)
+        out = torch.matmul(attn, v)
+        # 7) reassemble heads -> (B, D, C)
+        out = out.view(B, self.num_heads, D, self.head_dim)\
+                  .transpose(1, 2)\
+                  .reshape(B, D, C)
+
+        # 8) final linear layer
+        return self.out_proj(out)
+
+
+class LinformerEncoderLayer(nn.Module):
+    """
+    A single transformer encoder block using LinformerSelfAttention.
+    Pretty much just like nn.TransformerEncoderLayer, but with our lean attention.
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        k: int,
+        dim_feedforward: int,
+        max_seq_len: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        # our custom self-attention
+        self.self_attn = LinformerSelfAttention(embed_dim, num_heads, k, max_seq_len)
+        # a small feed-forward network
+        self.linear1 = nn.Linear(embed_dim, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, embed_dim)
+
+        # layer norms & dropouts as usual
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        # use ReLU like the original
+        self.activation = F.relu
+
+    def forward(self, src: Tensor, src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        """
+        src: (B, D, C)
+        src_key_padding_mask: (B, D), True=keep, False=pad
+        """
+        x = src
+        # 1) self-attention + add & norm
+        attn_out = self.self_attn(
+            x,
+            mask=(~src_key_padding_mask) if src_key_padding_mask is not None else None
+        )
+        x = x + self.dropout1(attn_out)
+        x = self.norm1(x)
+
+        # 2) feed-forward + add & norm
+        ff = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        x = x + self.dropout2(ff)
+        x = self.norm2(x)
+        return x
+
+
 
 import torch
 import torch.nn as nn
@@ -251,15 +423,14 @@ class PartialEncoder(nn.Module):
         ff_dim = ff_dim or (code_dim * 4)
 
         # replace masked‐mean with a transformer encoder layer
-        self.transformer_layer = nn.TransformerEncoderLayer(
-            d_model=code_dim,
-            nhead=n_heads,
+        self.transformer_layer = LinformerEncoderLayer(
+            embed_dim=code_dim,
+            num_heads=n_heads,
+            k= 64,  # or whatever k you want; k < D
             dim_feedforward=ff_dim,
             dropout=dropout_rate,
-            activation="relu",
-            batch_first=True,  # so it accepts (B, D, C)
+            max_seq_len=input_dim
         )
-
 
         # per-feature embeddings
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
@@ -321,7 +492,8 @@ class PartialEncoder(nn.Module):
 
         # apply the transformer layer
         # output shape is (B, D, code_dim)
-        #tr_out = self.transformer_layer(h_out, src_key_padding_mask=padding_mask)
+        #tr_out = self.transformer_layer(h_out, src_key_padding_mask=padding_mask)  # shape: (B, D, code_dim)
+
         tr_out = h_out
         # now pool across the D dimension (e.g. simple masked mean again)
         mask_exp = mask.unsqueeze(-1).float()                 # (B, D, 1)
@@ -374,155 +546,6 @@ class LinearDecoder(nn.Module):
         # final input to linear: (B, latent_dim + total_cov)
         inp = torch.cat([z, *covs], dim=1) if covs else z
         return self.linear(inp)
-
-
-
-
-# class PartialEncoder(nn.Module):
-#     def __init__(self, input_dim: int, h_hidden_dim: int, encoder_hidden_dim: int, 
-#                  latent_dim: int, code_dim: int, dropout_rate: float = 0.0):
-#         """
-#         Encoder network inspired by PointNet for partially observed data.
-
-#         Processes each observed feature individually using a shared network ('h_layer')
-#         combined with learnable feature embeddings and biases, then aggregates
-#         the results before mapping to the latent space.
-
-#         Parameters:
-#           input_dim (int): Dimension of input features (D). Number of junctions/features.
-#           h_hidden_dim (int): Hidden dimension for the shared 'h_layer'.
-#                            (Replaces the misuse of num_hidden_layers in the original h_layer definition).
-#           encoder_hidden_dim (int): Hidden dimension for the final 'encoder_mlp'.
-#                                  (Replaces the hardcoded 256 in the original encoder_mlp).
-#           latent_dim (int): Dimension of latent space (Z).
-#           code_dim (int): Dimension of feature embeddings and intermediate representations (K).
-#           dropout_rate (float): Dropout rate for regularization applied within h_layer and encoder_mlp.
-#         """
-#         super().__init__()
-#         self.input_dim = input_dim
-#         self.code_dim = code_dim
-#         self.latent_dim = latent_dim
-
-#         # Learnable feature embedding (F_d in paper notation)
-#         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim)) #D by K initialized via PCA 
-
-#         # Shared function h(.) applied to each feature representation s_d = [x_d, F_d]
-#         # Input dim: 1 (feature value) + K (embedding) = K + 1
-#         # Output dim: K (code_dim)
-#         self.h_layer = nn.Sequential(
-#             nn.Linear(1 + code_dim, h_hidden_dim),
-#             nn.LayerNorm(h_hidden_dim),           
-#             nn.ReLU(),
-#             nn.Dropout(dropout_rate), 
-#             nn.Linear(h_hidden_dim, code_dim),
-#             nn.LayerNorm(code_dim),   
-#             nn.ReLU()
-#         )
-
-#         # MLP to map aggregated representation 'c' to latent distribution parameters
-#         # Input dim: K (code_dim)
-#         # Output dim: 2 * Z (for mu and logvar)
-#         self.encoder_mlp = nn.Sequential(
-#             nn.Linear(code_dim, encoder_hidden_dim),
-#             nn.LayerNorm(encoder_hidden_dim),
-#             nn.ReLU(),
-#             nn.Dropout(dropout_rate), 
-#             nn.Linear(encoder_hidden_dim, 2 * latent_dim) # outputs both mu and logvar
-#         )
-
-#     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-#         """
-#         Forward pass of the encoder.
-
-#         Args:
-#             x (torch.Tensor): Input data (batch_size, input_dim). Missing values can be anything (e.g., 0, NaN),
-#                               as they will be masked out based on the 'mask' tensor.
-#                               It's crucial that the *observed* values in x are the actual measurements.
-#             mask (torch.Tensor): Binary mask (batch_size, input_dim). 1 indicates observed, 0 indicates missing.
-#                                Must be float or long/int and compatible with multiplication.
-
-#         Returns:
-#             tuple[torch.Tensor, torch.Tensor]:
-#                 - mu (torch.Tensor): Mean of latent distribution (batch_size, latent_dim).
-#                 - logvar (torch.Tensor): Log variance of latent distribution (batch_size, latent_dim).
-#         """
-#         batch_size = x.size(0)
-
-#         # --- Input Validation ---
-#         if x.shape[1] != self.input_dim or mask.shape[1] != self.input_dim:
-#              raise ValueError(f"Input tensor feature dimension ({x.shape[1]}) or mask dimension ({mask.shape[1]}) "
-#                               f"does not match encoder input_dim ({self.input_dim})")
-#         if x.shape != mask.shape:
-#              raise ValueError(f"Input tensor shape ({x.shape}) and mask shape ({mask.shape}) must match.")
-#         if x.ndim != 2 or mask.ndim != 2:
-#              raise ValueError(f"Input tensor and mask must be 2D (batch_size, input_dim). Got shapes {x.shape} and {mask.shape}")
-
-#         # Step 1: Reshape inputs for processing each feature independently
-#         # Flatten batch and feature dimensions: (B, D) -> (B*D, 1)
-#         x_flat = x.reshape(-1, 1)                                # Shape: (B*D, 1)
-
-#         # Step 2: Prepare feature embeddings and biases for each item in the flattened batch
-#         # Feature embeddings F_d: (D, K) -> (B*D, K) by repeating for each batch item
-
-#         # Efficient expansion using broadcasting
-#         F_embed = self.feature_embedding.unsqueeze(0).expand(batch_size, -1, -1).reshape(-1, self.code_dim) # Shape: (B*D, K)
-
-#         # Step 3: Construct input for the shared 'h' function for each feature instance
-#         # Input s_d = [x_d, F_d]
-#         h_input = torch.cat([x_flat, F_embed], dim=1)  # Shape: (B*D, 1 + K + 1)
-
-#         # Step 4: Apply the shared h network to each feature representation s_d
-#         h_out_flat = self.h_layer(h_input)                      # Shape: (B*D, K)
-
-#         # Step 5: Reshape back to (batch_size, num_features, code_dim)
-#         h_out = h_out_flat.view(batch_size, self.input_dim, self.code_dim)  # Shape: (B, D, K)
-
-#         # Step 6: Apply the mask. Zero out representations of missing features.
-#         mask_float = mask.float() 
-#         # Expand mask: (B, D) -> (B, D, 1) for broadcasting
-#         mask_exp = mask_float.unsqueeze(-1)                           # Shape: (B, D, 1)
-#         h_masked = h_out * mask_exp                             # Shape: (B, D, K)
-
-#         # Step 7: Aggregate over observed features (permutation-invariant function g)
-#         # Sum along the feature dimension (dim=1) --> combining Features Per Cell 
-#         c = h_masked.sum(dim=1)                                 # Shape: (B, K)
-
-#         # Step 8: Pass the aggregated representation 'c' through the final MLP 
-#         enc_out = self.encoder_mlp(c)                           # Shape: (B, 2*Z)
-
-#         # Step 9: Split the output into mean (mu) and log variance (logvar)
-#         mu, logvar = enc_out.chunk(2, dim=-1)                   # Shapes: (B, Z), (B, Z)
-
-#         return mu, logvar
-
-# class LinearDecoder(nn.Module):
-#     def __init__(self, latent_dim: int, output_dim: int):
-#         """
-#         Simple linear decoder that directly maps from latent space to output space.
-        
-#         Parameters:
-#           latent_dim (int): Dimension of latent space (Z).
-#           output_dim (int): Dimension of output space (D).
-#         """
-#         super().__init__()
-#         self.latent_dim = latent_dim
-#         self.output_dim = output_dim
-        
-#         # Simple linear layer from latent space to output space
-#         self.linear = nn.Linear(latent_dim, output_dim)
-    
-#     def forward(self, z: torch.Tensor) -> torch.Tensor:
-#         """
-#         Forward pass of the decoder.
-        
-#         Args:
-#             z (torch.Tensor): Latent vector (batch_size, latent_dim).
-            
-#         Returns:
-#             torch.Tensor: Reconstructed data (batch_size, output_dim).
-#         """
-#         # Direct linear mapping from latent to output
-#         return self.linear(z)
 
 class PARTIALVAE(BaseModuleClass):
     """
@@ -826,6 +849,7 @@ class PARTIALVAE(BaseModuleClass):
                 atse_counts=atse_counts,
                 junc2atse=self.junc2atse,
                 alpha=alpha,
+                mask = mask,
             )
             # negative mean‐log‐lik
             reconst = -ll

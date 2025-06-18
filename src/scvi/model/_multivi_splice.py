@@ -433,10 +433,10 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         ).coalesce()
 
     def init_junc2atse(self) -> None:
-        cl_info = self.adata_manager.data_registry["cluster_counts"]
+        cl_info = self.adata_manager.data_registry["atse_counts_key"]
         cl_key, mod_key = cl_info.attr_key, cl_info.mod_key
         cluster_counts = self.adata[mod_key].layers[cl_key]
-        atse_labels = self.adata.var["event_id"]
+        atse_labels = self.adata[mod_key].var["event_id"]
         j2a = self.make_junc2atse(atse_labels)
         self.module.junc2atse = j2a.coalesce().to(self.module.device)
 
@@ -453,6 +453,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         import numpy as np
         import torch
 
+        print("Initializing Feature Embeddings...")
         jr_info = self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY]
         jr_key, mod_key = jr_info.attr_key, jr_info.mod_key
 
@@ -491,6 +492,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
                 torch.as_tensor(comps, dtype=self.module.z_encoder_splicing.feature_embedding.dtype)
             )
         X[C == 0] = 0
+        print("Initialized Feature Embeddings!")
 
 
     @devices_dsp.dedent

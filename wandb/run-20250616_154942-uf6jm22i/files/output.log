@@ -1,0 +1,101 @@
+/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/mudata/_core/mudata.py:1531: FutureWarning: From 0.4 .update() will not pull obs/var columns from individual modalities by default anymore. Set mudata.set_options(pull_on_update=False) to adopt the new behaviour, which will become the default. Use new pull_obs/pull_var and push_obs/push_var methods for more flexibility.
+  self._update_attr("var", axis=0, join_common=join_common)
+/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/mudata/_core/mudata.py:1429: FutureWarning: From 0.4 .update() will not pull obs/var columns from individual modalities by default anymore. Set mudata.set_options(pull_on_update=False) to adopt the new behaviour, which will become the default. Use new pull_obs/pull_var and push_obs/push_var methods for more flexibility.
+  self._update_attr("obs", axis=1, join_common=join_common)
+Junction Ratio: [[0. 0. 0. ... 0. 0. 0.]
+ [0. 0. 0. ... 0. 0. 0.]
+ [0. 0. 0. ... 0. 0. 0.]
+ ...
+ [1. 0. 0. ... 0. 0. 0.]
+ [0. 0. 0. ... 0. 0. 0.]
+ [0. 0. 0. ... 0. 0. 0.]]
+Now splicing layers: KeysView(Layers with keys: cell_by_cluster_matrix, cell_by_junction_matrix, junc_ratio, psi_mask)
+Mask: <Compressed Sparse Row sparse matrix of dtype 'uint8'
+	with 795735330 stored elements and shape (83321, 34845)>
+  Coords	Values
+  (0, 36)	1
+  (0, 37)	1
+  (0, 98)	1
+  (0, 99)	1
+  (0, 100)	1
+  (0, 101)	1
+  (0, 102)	1
+  (0, 161)	1
+  (0, 162)	1
+  (0, 168)	1
+  (0, 169)	1
+  (0, 170)	1
+  (0, 171)	1
+  (0, 172)	1
+  (0, 194)	1
+  (0, 195)	1
+  (0, 196)	1
+  (0, 197)	1
+  (0, 198)	1
+  (0, 199)	1
+  (0, 200)	1
+  (0, 210)	1
+  (0, 211)	1
+  (0, 212)	1
+  (0, 213)	1
+  :	:
+  (83320, 34754)	1
+  (83320, 34755)	1
+  (83320, 34756)	1
+  (83320, 34757)	1
+  (83320, 34758)	1
+  (83320, 34759)	1
+  (83320, 34760)	1
+  (83320, 34761)	1
+  (83320, 34781)	1
+  (83320, 34782)	1
+  (83320, 34783)	1
+  (83320, 34798)	1
+  (83320, 34799)	1
+  (83320, 34800)	1
+  (83320, 34806)	1
+  (83320, 34807)	1
+  (83320, 34808)	1
+  (83320, 34809)	1
+  (83320, 34810)	1
+  (83320, 34811)	1
+  (83320, 34812)	1
+  (83320, 34818)	1
+  (83320, 34819)	1
+  (83320, 34820)	1
+  (83320, 34821)	1
+junc_ratio shape: (83321, 34845)
+MuData modalities loaded: ['rna', 'splicing']
+MuData object with n_obs × n_vars = 83321 × 53867
+  obs:	'cell_id', 'age', 'cell_ontology_class', 'mouse.id', 'sex', 'tissue', 'dataset', 'broad_cell_type', 'cell_id_index', 'cell_name', 'modality'
+  var:	'ID', 'modality'
+  obsm:	'X_library_size'
+  2 modalities
+    rna:	83321 x 19022
+      obs:	'cell_id_index', 'age', 'cell_ontology_class', 'mouse.id', 'sex', 'subtissue', 'tissue', 'dataset', 'cell_name', 'cell_id', 'cell_clean', 'broad_cell_type', 'seqtech', 'modality'
+      var:	'ID', 'modality'
+      uns:	'hvg', 'log1p'
+      obsm:	'X_library_size'
+      layers:	'length_norm', 'log_norm', 'predicted_log_norm_tms', 'raw_counts', 'working_norm'
+    splicing:	83321 x 34845
+      obs:	'cell_id_index', 'age', 'cell_ontology_class', 'mouse.id', 'sex', 'subtissue', 'tissue', 'dataset', 'cell_name', 'cell_id', 'cell_clean', 'broad_cell_type', 'seqtech', 'modality'
+      var:	'ID', 'modality'
+      layers:	'cell_by_cluster_matrix', 'cell_by_junction_matrix', 'junc_ratio', 'psi_mask'
+[34mINFO    [0m Generating sequential column names
+/gpfs/commons/home/svaidyanathan/repos/scvi-tools-splicing/src/scvi/data/fields/_base_field.py:63: UserWarning: adata.layers[junc_ratio] does not contain unnormalized count data. Are you sure this is what you want?
+  self.validate_field(adata)
+Initializing model with: {'n_latent': 20, 'modality_weights': 'equal', 'splicing_loss_type': 'dirichlet_multinomial', 'splicing_architecture': 'partial', 'expression_architecture': 'linear'}
+Not in beta_binomial, turning off gradient for log_phi.
+Traceback (most recent call last):
+  File "/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/multivi_splice_utils/runfiles/multivirun.py", line 209, in <module>
+    model = scvi.model.MULTIVISPLICE(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/gpfs/commons/home/svaidyanathan/repos/scvi-tools-splicing/src/scvi/model/_multivi_splice.py", line 365, in __init__
+    self.module = self._module_cls(
+                  ^^^^^^^^^^^^^^^^^
+  File "/gpfs/commons/home/svaidyanathan/repos/scvi-tools-splicing/src/scvi/module/_multivae_splice.py", line 312, in __init__
+    self.log_phi_j = torch.tensor(10.0)
+    ^^^^^^^^^^^^^^
+  File "/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1956, in __setattr__
+    raise TypeError(
+TypeError: cannot assign 'torch.FloatTensor' as parameter 'log_phi_j' (torch.nn.Parameter or None expected)
