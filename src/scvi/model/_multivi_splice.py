@@ -256,6 +256,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             * ``"equal"``: equal weight per modality,
             * ``"universal"``: learn a universal weight for each modality,
             * ``"cell"``: learn cell-specific weights.
+            * ``"concatenate"``: do not mix the two representations and instead concatenate them
     modality_penalty
         Penalty applied during training. Options are ``"Jeffreys"``, ``"MMD"``, or ``"None"``.
     n_hidden
@@ -318,7 +319,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         adata: AnnOrMuData,
         n_genes: int | None = None,
         n_junctions: int | None = None,
-        modality_weights: Literal["equal", "cell", "universal"] = "equal",
+        modality_weights: Literal["equal", "cell", "universal", "concatenate"] = "equal",
         modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
         n_hidden: int | None = None,
         n_latent: int | None = None,

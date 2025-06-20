@@ -102,8 +102,9 @@ class MULTIVAESPLICE(BaseModuleClass):
         Number of gene expression features.
     n_input_junctions : int
         Number of alternative splicing (junction) features.
-    modality_weights : Literal["equal", "cell", "universal"], default "equal"
+    modality_weights : Literal["equal", "cell", "universal", "concatenate"], default "equal"
         Weighting scheme across modalities.
+        If "concatenate", then modality latent spaces are not mixed and instead concatenated.
     modality_penalty : Literal["Jeffreys", "MMD", "None"], default "Jeffreys"
         Penalty to align the latent distributions.
     n_batch : int, default 0
@@ -169,7 +170,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         self,
         n_input_genes: int = 0,
         n_input_junctions: int = 0,
-        modality_weights: Literal["equal", "cell", "universal"] = "equal",
+        modality_weights: Literal["equal", "cell", "universal", "concatenate"] = "equal",
         modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
         n_batch: int = 0,
         n_obs: int = 0,
@@ -275,7 +276,10 @@ class MULTIVAESPLICE(BaseModuleClass):
             use_layer_norm=self.use_layer_norm_encoder,
             deep_inject_covariates=deeply_inject_covariates,
         )
+
         n_input_decoder = self.n_latent + self.n_continuous_cov
+        if modality_weights == "concatenate":
+            n_input_decoder += self.n_latent
 
         if expression_architecture == "vanilla":
             self.z_decoder_expression = DecoderSCVI(
@@ -357,8 +361,11 @@ class MULTIVAESPLICE(BaseModuleClass):
             else:
                 self.z_encoder_splicing.z_transformation = lambda x: x
 
+            input_linear_splicing_decoder = self.n_latent
+            if (modality_weights=="concatenate"):
+                input_linear_splicing_decoder += self.n_latent
             self.z_decoder_splicing = LinearDecoder(
-                latent_dim=self.n_latent,
+                latent_dim=input_linear_splicing_decoder,
                 output_dim=n_input_junctions,
                 n_cat_list=cat_list,
                 n_cont=n_continuous_cov,
@@ -492,16 +499,22 @@ class MULTIVAESPLICE(BaseModuleClass):
                 encoder_input_expr, batch_index, *categorical_input
             )
 
+
         # mix representations
 
-        if self.modality_weights == "cell":
-            weights = self.mod_weights[cell_idx, :]
+        if self.modality_weights == "concatenate":
+            # just glue the two posterior stats end-to-end
+            qz_m = torch.cat((qzm_expr, qzm_spl), dim=1)
+            qz_v = torch.cat((qzv_expr, qzv_spl), dim=1)
         else:
-            weights = self.mod_weights.unsqueeze(0).expand(len(cell_idx), -1)
+            if self.modality_weights == "cell":
+                weights = self.mod_weights[cell_idx, :]
+            else:
+                weights = self.mod_weights.unsqueeze(0).expand(len(cell_idx), -1)
 
-        qz_m = mix_modalities((qzm_expr, qzm_spl), (mask_expr, mask_spl), weights)
-        qz_v = mix_modalities((qzv_expr, qzv_spl), (mask_expr, mask_spl), weights, torch.sqrt)
-        qz_v = torch.clamp(qz_v, min=1e-6)
+            qz_m = mix_modalities((qzm_expr, qzm_spl), (mask_expr, mask_spl), weights)
+            qz_v = mix_modalities((qzv_expr, qzv_spl), (mask_expr, mask_spl), weights, torch.sqrt)
+            qz_v = torch.clamp(qz_v, min=1e-6)
 
         # print(
         #     "After mix:",
@@ -958,7 +971,11 @@ class MULTIVAESPLICE(BaseModuleClass):
         Tensor
             A scalar penalty computed over cells where both modalities are observed.
         """
+
         mask = torch.logical_and(mask1, mask2)
+        if self.modality_weights == "concatenate":
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        
         if self.modality_penalty == "None":
             return 0
         elif self.modality_penalty == "Jeffreys":
