@@ -328,6 +328,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         dropout_rate: float = 0.1,
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
+        dm_concentration: Literal["atse", "scalar"] = "atse",
         splicing_concentration: float | None = None,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
@@ -379,6 +380,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             dropout_rate=dropout_rate,
             splicing_loss_type = splicing_loss_type,
             splicing_concentration = splicing_concentration,
+            dm_concentration= dm_concentration,
             gene_likelihood=gene_likelihood,
             gene_dispersion=dispersion,
             splicing_architecture = splicing_architecture,
@@ -413,6 +415,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         self.n_genes = n_genes
         self.n_junctions = n_junctions
         self.get_normalized_function_name = "get_normalized_splicing"
+        self.dm_concentration = dm_concentration
 
         if self.adata is not None:
                 if initialize_embeddings_from_pca and splicing_architecture == "partial":
@@ -426,6 +429,13 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         atse_labels = atse_labels.astype('category')
         row_indices = torch.arange(num_junctions, dtype=torch.long)
         col_indices = torch.tensor(atse_labels.cat.codes.values)
+        num_atses = len(atse_labels.cat.categories)
+        print(f"Found {num_junctions} junctions and {num_atses} ATSEs.")
+        from torch import nn
+        if self.dm_concentration== "atse":
+            print("Using ATSE level concentration, overwriting concentration parameter.")
+            self.module.log_phi_j = nn.Parameter(torch.randn(num_atses) * 0.5 + np.log(100.0))
+            self.module.log_phi_j.requires_grad_(True)
 
         return torch.sparse_coo_tensor(
             indices=torch.stack([row_indices, col_indices]),
@@ -438,6 +448,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         cl_key, mod_key = cl_info.attr_key, cl_info.mod_key
         cluster_counts = self.adata[mod_key].layers[cl_key]
         atse_labels = self.adata[mod_key].var["event_id"]
+
         j2a = self.make_junc2atse(atse_labels)
         self.module.junc2atse = j2a.coalesce().to(self.module.device)
 

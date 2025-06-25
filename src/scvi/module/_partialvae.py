@@ -411,6 +411,8 @@ class PartialEncoder(nn.Module):
         inject_covariates: bool = True,
         n_heads: int = 4,              # how many attention heads
         ff_dim: int | None = None,     # inner dim of the FFN
+        use_transformer: bool = False,
+        linformer_k: int = 512,
     ):
         super().__init__()
         # keep track of how many one-hot cats and cont features
@@ -419,18 +421,22 @@ class PartialEncoder(nn.Module):
         self.inject_covariates = inject_covariates
         total_cov = sum(self.n_cat_list) + self.n_cont
         self.code_dim = code_dim
+        self.use_transformer = use_transformer
+        self.linformer_k = linformer_k
 
         ff_dim = ff_dim or (code_dim * 4)
 
         # replace masked‐mean with a transformer encoder layer
-        self.transformer_layer = LinformerEncoderLayer(
-            embed_dim=code_dim,
-            num_heads=n_heads,
-            k= 64,  # or whatever k you want; k < D
-            dim_feedforward=ff_dim,
-            dropout=dropout_rate,
-            max_seq_len=input_dim
-        )
+        if self.use_transformer:
+            print(f"Using Transformer Layer with Linformer k = {self.linformer_k}")
+            self.transformer_layer = LinformerEncoderLayer(
+                embed_dim=code_dim,
+                num_heads=n_heads,
+                k= self.linformer_k,  # or whatever k you want; k < D
+                dim_feedforward=ff_dim,
+                dropout=dropout_rate,
+                max_seq_len=input_dim
+            )
 
         # per-feature embeddings
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
@@ -492,9 +498,10 @@ class PartialEncoder(nn.Module):
 
         # apply the transformer layer
         # output shape is (B, D, code_dim)
-        #tr_out = self.transformer_layer(h_out, src_key_padding_mask=padding_mask)  # shape: (B, D, code_dim)
-
-        tr_out = h_out
+        if self.use_transformer:
+            tr_out = self.transformer_layer(h_out, src_key_padding_mask=padding_mask)  # shape: (B, D, code_dim)
+        else:
+            tr_out = h_out
         # now pool across the D dimension (e.g. simple masked mean again)
         mask_exp = mask.unsqueeze(-1).float()                 # (B, D, 1)
         c = (tr_out * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-8)
@@ -617,6 +624,8 @@ class PARTIALVAE(BaseModuleClass):
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
         learn_concentration: bool = True,
+        use_transformer: bool = False,
+        linformer_k: int = 512,
     ):
         super().__init__()
 
@@ -658,6 +667,8 @@ class PARTIALVAE(BaseModuleClass):
             n_cat_list=encoder_cat_list,
             n_cont=n_continuous_cov,
             inject_covariates=encode_covariates,
+            use_transformer = use_transformer,
+            linformer_k = linformer_k,
         )
         if latent_distribution == "ln":
             self.encoder.z_transformation = nn.Softmax(dim=-1)

@@ -196,6 +196,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         encode_covariates: bool = False,
         use_size_factor_key: bool = False,
         splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
+        dm_concentration: Literal["atse", "scalar"] = "atse",
         splicing_concentration: float | None = None,
         **model_kwargs,
     ):
@@ -212,6 +213,9 @@ class MULTIVAESPLICE(BaseModuleClass):
         self.gene_likelihood = gene_likelihood
         self.latent_distribution = latent_distribution
         self.n_latent = int(np.sqrt(self.n_hidden)) if n_latent is None else n_latent
+        self.n_latent_original = n_latent
+        if modality_weights == "concatenate":
+            self.n_latent*=2
         self.n_layers_encoder = n_layers_encoder
         self.n_layers_decoder = n_layers_decoder
         self.n_cats_per_cov = n_cats_per_cov
@@ -234,6 +238,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         self.code_dim = code_dim
         self.h_hidden_dim = h_hidden_dim
         self.mlp_encoder_hidden_dim = mlp_encoder_hidden_dim
+        self.dm_concentration = dm_concentration
 
         cat_list = [n_batch] + list(n_cats_per_cov) if n_cats_per_cov is not None else []
         encoder_cat_list = cat_list if encode_covariates else None
@@ -252,9 +257,10 @@ class MULTIVAESPLICE(BaseModuleClass):
             raise ValueError("gene_dispersion must be one of ['gene', 'gene-batch', 'gene-label', 'gene-cell']")
         input_exp = n_input_genes if n_input_genes > 0 else 1
         n_input_encoder_exp = input_exp + n_continuous_cov * int(encode_covariates)
+        encoderlatentdim = self.n_latent_original
         self.z_encoder_expression = Encoder(
             n_input=n_input_encoder_exp,
-            n_output=self.n_latent,
+            n_output=encoderlatentdim,
             n_cat_list=encoder_cat_list,
             n_layers=n_layers_encoder,
             n_hidden=self.n_hidden,
@@ -278,8 +284,6 @@ class MULTIVAESPLICE(BaseModuleClass):
         )
 
         n_input_decoder = self.n_latent + self.n_continuous_cov
-        if modality_weights == "concatenate":
-            n_input_decoder += self.n_latent
 
         if expression_architecture == "vanilla":
             self.z_decoder_expression = DecoderSCVI(
@@ -305,23 +309,28 @@ class MULTIVAESPLICE(BaseModuleClass):
         # ---------------- Splicing Branch ----------------
         input_spl = n_input_junctions if n_input_junctions > 0 else 1
         n_input_encoder_spl = input_spl + n_continuous_cov * int(encode_covariates)
-
-        # Initialize log_phi_j with a value of 100.0
-        self.log_phi_j = nn.Parameter(torch.randn(n_input_junctions) * 0.5 + np.log(100.0))
         
-        if not self.splicing_loss_type == "beta_binomial":
-            # turn off grads so optimizer ignores φ if not beta binomial loss
-            print("Not in beta_binomial, turning off gradient for log_phi.")
-            if self.splicing_loss_type == "dirichlet_multinomial":
-                self.log_phi_j = nn.Parameter(torch.tensor(4.6))
+        print("Initializing Log Phi Concentration parameter (if relevant)")
+        # Initialize log_phi_j with a value of 100.0
+        if self.splicing_loss_type == "beta_binomial":
+            self.log_phi_j = nn.Parameter(torch.randn(n_input_junctions) * 0.5 + np.log(100.0))
+            self.log_phi_j.requires_grad_(True)
+        elif self.splicing_loss_type == "dirichlet_multinomial": 
+            self.log_phi_j = nn.Parameter(torch.tensor(4.6))
+            #if dm, once the anndata is set we will set the per atse concentration there in multivisplice.
+            self.log_phi_j.requires_grad_(True)
+            #later change to per atse?
+        else:
+            self.log_phi_j = nn.Parameter(torch.tensor(0.0))
             self.log_phi_j.requires_grad_(False)
+
         
 
         if (splicing_architecture=="vanilla"):
             self.z_encoder_splicing = Encoder(
                 n_input=n_input_encoder_spl,
                 n_layers=n_layers_encoder,
-                n_output=self.n_latent,
+                n_output=encoderlatentdim,
                 n_hidden=self.n_hidden,
                 n_cat_list=encoder_cat_list,
                 dropout_rate=dropout_rate,
@@ -349,7 +358,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             code_dim=code_dim,
             h_hidden_dim=h_hidden_dim,
             encoder_hidden_dim=mlp_encoder_hidden_dim,
-            latent_dim=self.n_latent,
+            latent_dim=encoderlatentdim,
             dropout_rate=dropout_rate,
             n_cat_list=encoder_cat_list,
             n_cont=n_continuous_cov,
@@ -362,8 +371,7 @@ class MULTIVAESPLICE(BaseModuleClass):
                 self.z_encoder_splicing.z_transformation = lambda x: x
 
             input_linear_splicing_decoder = self.n_latent
-            if (modality_weights=="concatenate"):
-                input_linear_splicing_decoder += self.n_latent
+
             self.z_decoder_splicing = LinearDecoder(
                 latent_dim=input_linear_splicing_decoder,
                 output_dim=n_input_junctions,
@@ -762,7 +770,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         # ───── L2 prior on log-concentrations ϕ_j (global → per-cell) ────
         lambda_prior = 1e-2                       # can tune 
 
-        if self.splicing_loss_type == "beta_binomial":
+        if self.splicing_loss_type == "beta_binomial" or self.splicing_loss_type == "dirichlet_multinomial": #add dirichlet multinomial atse concentration stuff
             prior_loss = lambda_prior * torch.square(self.log_phi_j).sum() / x.size(0)  # divide by batch_size so strength is constant
         else:
             prior_loss = 0.0 #do not compute prior loss if we're not using beta_binomial distribution
@@ -928,10 +936,33 @@ class MULTIVAESPLICE(BaseModuleClass):
                 self.junc2atse, logits, lse
             )                                                       # → (N, J)
 
-            # 3) build α = concentration × exp(softmax_logits)
-            #    you can pull this from self.splicing_concentration or default to 10.0
-            conc = 10.0
-            alpha = conc * torch.exp(sm_logits)
+            # 3) build your concentration per junction from phi
+            #    phi may be:
+            #      • a scalar tensor → same phi for every junction
+            #      • a 1-D tensor of length G → one phi per ATSE
+            #      • a 1-D tensor of length J → one phi per junction
+            if phi.ndim == 0:
+                # scalar
+                conc_junc = phi
+                #print("Phi is a Scalar Value")
+            elif phi.ndim == 1 and phi.shape[0] == self.junc2atse.size(1):
+                # per-ATSE → map to per-junction by sparse‐matrix multiply
+                #    self.junc2atse : (J × G), phi.unsqueeze(1) : (G × 1)
+                if self.junc2atse.device != p.device:
+                    self.junc2atse = self.junc2atse.to(p.device)
+                conc_junc = torch.sparse.mm(self.junc2atse, phi.unsqueeze(1)).squeeze(1)
+                #print("Phi is per ATSE")
+            elif phi.ndim == 1 and phi.shape[0] == self.junc2atse.size(0):
+                # already per-junction
+                conc_junc = phi
+                #print("Phi is per Junction")
+            else:
+                raise ValueError(f"Unexpected phi shape {tuple(phi.shape)}")
+
+            # now conc_junc is either a 0-D tensor or a 1-D length-J tensor.
+            # broadcast to (N × J) by unsqueezing
+            conc = conc_junc.unsqueeze(0) # shape (1, J)
+            alpha = p * conc # broadcasting (1, J) → (N, J)
 
             # 4) feed into our DM‐likelihood helper
             ll = self.dirichlet_multinomial_likelihood(
