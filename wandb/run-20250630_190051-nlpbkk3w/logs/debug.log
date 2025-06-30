@@ -1,0 +1,23 @@
+2025-06-30 19:00:51,818 INFO    MainThread:2794275 [wandb_setup.py:_flush():67] Current SDK version is 0.19.7
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_setup.py:_flush():67] Configure stats pid to 2794275
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_setup.py:_flush():67] Loading settings from /gpfs/commons/home/svaidyanathan/.config/wandb/settings
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_setup.py:_flush():67] Loading settings from /gpfs/commons/home/svaidyanathan/repos/scvi-tools-splicing/wandb/settings
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_setup.py:_flush():67] Loading settings from environment variables
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_init.py:setup_run_log_directory():647] Logging user logs to /gpfs/commons/home/svaidyanathan/repos/scvi-tools-splicing/wandb/run-20250630_190051-nlpbkk3w/logs/debug.log
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_init.py:setup_run_log_directory():648] Logging internal logs to /gpfs/commons/home/svaidyanathan/repos/scvi-tools-splicing/wandb/run-20250630_190051-nlpbkk3w/logs/debug-internal.log
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_init.py:init():761] calling init triggers
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_init.py:init():766] wandb.init called with sweep_config: {}
+config: {'code_dim': 32, 'h_hidden_dim': 64, 'encoder_hidden_dim': 128, 'latent_dim': 10, 'dropout_rate': 0.01, 'learn_concentration': True, 'splice_likelihood': 'dirichlet_multinomial', 'encode_covariates': False, 'deeply_inject_covariates': True, 'initialize_embeddings_from_pca': True, 'use_transformer': False, 'max_epochs': 2000, 'lr': 1e-05, 'accelerator': 'auto', 'devices': 'auto', 'train_size': None, 'validation_size': None, 'shuffle_set_split': True, 'batch_size': 256, 'weight_decay': 0.001, 'eps': 1e-08, 'early_stopping': True, 'save_best': True, 'check_val_every_n_epoch': None, 'n_steps_kl_warmup': None, 'n_epochs_kl_warmup': 50, 'reduce_lr_on_plateau': False, 'lr_factor': 0.6, 'lr_patience': 30, 'lr_threshold': 0.0, 'lr_min': 0.0, 'datasplitter_kwargs': None, 'plan_kwargs': None, 'adata_path': '/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/052025/train_70_30_ge_splice_combined_20250513_035938.h5mu', 'model_dir': '/gpfs/commons/home/svaidyanathan/splice_vi_partial_vae_runs/SpliceVI_PartialVAE_Training_20250630_185931_job5450236/models', 'fig_dir': '/gpfs/commons/home/svaidyanathan/splice_vi_partial_vae_runs/SpliceVI_PartialVAE_Training_20250630_185931_job5450236/figures', 'umap_colors': ['cell_type_grouped'], '_wandb': {}}
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_init.py:init():784] starting backend
+2025-06-30 19:00:51,819 INFO    MainThread:2794275 [wandb_init.py:init():788] sending inform_init request
+2025-06-30 19:00:51,854 INFO    MainThread:2794275 [backend.py:_multiprocessing_setup():97] multiprocessing start_methods=fork,spawn,forkserver, using: spawn
+2025-06-30 19:00:51,860 INFO    MainThread:2794275 [wandb_init.py:init():803] backend started and connected
+2025-06-30 19:00:51,862 INFO    MainThread:2794275 [wandb_init.py:init():896] updated telemetry
+2025-06-30 19:00:51,889 INFO    MainThread:2794275 [wandb_init.py:init():920] communicating run to backend with 90.0 second timeout
+2025-06-30 19:00:52,272 INFO    MainThread:2794275 [wandb_init.py:init():995] starting run threads in backend
+2025-06-30 19:00:54,926 INFO    MainThread:2794275 [wandb_run.py:_console_start():2377] atexit reg
+2025-06-30 19:00:54,926 INFO    MainThread:2794275 [wandb_run.py:_redirect():2227] redirect: wrap_raw
+2025-06-30 19:00:54,928 INFO    MainThread:2794275 [wandb_run.py:_redirect():2292] Wrapping output streams.
+2025-06-30 19:00:54,928 INFO    MainThread:2794275 [wandb_run.py:_redirect():2317] Redirects installed.
+2025-06-30 19:00:54,931 INFO    MainThread:2794275 [wandb_init.py:init():1037] run started, returning control to user process
+2025-06-30 19:04:12,542 INFO    MainThread:2794275 [wandb_watch.py:_watch():71] Watching

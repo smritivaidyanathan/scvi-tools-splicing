@@ -1,0 +1,68 @@
+Loading AnnData from /gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/052025/train_70_30_ge_splice_combined_20250513_035938.h5mu…
+/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/mudata/_core/mudata.py:1531: FutureWarning: From 0.4 .update() will not pull obs/var columns from individual modalities by default anymore. Set mudata.set_options(pull_on_update=False) to adopt the new behaviour, which will become the default. Use new pull_obs/pull_var and push_obs/push_var methods for more flexibility.
+  self._update_attr("var", axis=0, join_common=join_common)
+/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/mudata/_core/mudata.py:931: UserWarning: Cannot join columns with the same name because var_names are intersecting.
+  warnings.warn(
+/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/mudata/_core/mudata.py:1429: FutureWarning: From 0.4 .update() will not pull obs/var columns from individual modalities by default anymore. Set mudata.set_options(pull_on_update=False) to adopt the new behaviour, which will become the default. Use new pull_obs/pull_var and push_obs/push_var methods for more flexibility.
+  self._update_attr("obs", axis=1, join_common=join_common)
+Found Layers: Layers with keys: cell_by_cluster_matrix, cell_by_junction_matrix, junc_ratio, psi_mask
+Setting up SpliceVI PartialVAE…
+Initializing model with: {'dropout_rate': 0.01, 'splice_likelihood': 'dirichlet_multinomial'}
+Using Vanilla Version (Impute)
+Initializing Feature Embeddings from Adata...
+Initialized Feature Embeddings.
+Making Junc2Atse...
+Total model parameters: 5,966,197
+Anndata setup with scvi-tools version 1.3.1.
+
+Setup via `SPLICEVI.setup_anndata` with arguments:
+{
+│   'junc_ratio_layer': 'junc_ratio',
+│   'junc_counts_layer': 'cell_by_junction_matrix',
+│   'cluster_counts_layer': 'cell_by_cluster_matrix',
+│   'psi_mask_layer': 'psi_mask',
+│   'batch_key': None,
+│   'size_factor_key': None,
+│   'categorical_covariate_keys': None,
+│   'continuous_covariate_keys': None
+}
+
+       Summary Statistics
+┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┓
+┃  Summary Stat Key   ┃ Value  ┃
+┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━┩
+│       n_batch       │   1    │
+│       n_cells       │ 110192 │
+│  n_cluster_counts   │ 34845  │
+│  n_junction_counts  │ 34845  │
+│ n_psi_observed_mask │ 34845  │
+│       n_vars        │ 34845  │
+└─────────────────────┴────────┘
+                         Data Registry
+┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃   Registry Key    ┃           scvi-tools Location           ┃
+┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│         X         │       adata.layers['junc_ratio']        │
+│       batch       │        adata.obs['_scvi_batch']         │
+│  cluster_counts   │ adata.layers['cell_by_cluster_matrix']  │
+│  junction_counts  │ adata.layers['cell_by_junction_matrix'] │
+│ psi_observed_mask │        adata.layers['psi_mask']         │
+└───────────────────┴─────────────────────────────────────────┘
+                     batch State Registry
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
+┃     Source Location      ┃ Categories ┃ scvi-tools Encoding ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━┩
+│ adata.obs['_scvi_batch'] │     0      │          0          │
+└──────────────────────────┴────────────┴─────────────────────┘
+Training with: {'max_epochs': 2000, 'lr': 1e-05, 'batch_size': 256, 'n_epochs_kl_warmup': 50}
+/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/splicevi_utils/runfiles/splicevipartialvae.py:237: DeprecationWarning: `save_best` is deprecated in v1.2 and will be removed in v1.3. Please use `enable_checkpointing` instead. See https://github.com/scverse/scvi-tools/issues/2568 for more details.
+  model.train(logger=wandb_logger, check_val_every_n_epoch=5, **train_kwargs)
+/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/lightning/fabric/plugins/environments/slurm.py:204: The `srun` command is available on your system but is not used. HINT: If your intention is to run Lightning on SLURM, prepend your python command with `srun` like so: srun python /gpfs/commons/home/svaidyanathan/repos/multivi_tools ...
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/lightning/fabric/plugins/environments/slurm.py:204: The `srun` command is available on your system but is not used. HINT: If your intention is to run Lightning on SLURM, prepend your python command with `srun` like so: srun python /gpfs/commons/home/svaidyanathan/repos/multivi_tools ...
+You are using a CUDA device ('NVIDIA L40S') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
+/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/pytorch_lightning/loggers/wandb.py:397: There is a wandb run already in progress and newly created instances of `WandbLogger` will reuse this run. If this is not desired, call `wandb.finish()` before instantiating `WandbLogger`.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Epoch 3/2000:   0%|          | 2/2000 [04:36<76:23:12, 137.63s/it, v_num=0jb8, train_loss_step=2.99e+4, train_loss_epoch=2.94e+4]

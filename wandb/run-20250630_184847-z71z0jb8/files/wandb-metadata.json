@@ -1,0 +1,95 @@
+{
+  "os":  "Linux-5.15.0-119-generic-x86_64-with-glibc2.35",
+  "python":  "CPython 3.12.8",
+  "startedAt":  "2025-06-30T22:48:47.163697Z",
+  "args":  [
+    "--adata_path",
+    "/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/052025/train_70_30_ge_splice_combined_20250513_035938.h5mu",
+    "--model_dir",
+    "/gpfs/commons/home/svaidyanathan/splice_vi_partial_vae_runs/SpliceVI_PartialVAE_Training_20250630_184733_job5450115/models",
+    "--fig_dir",
+    "/gpfs/commons/home/svaidyanathan/splice_vi_partial_vae_runs/SpliceVI_PartialVAE_Training_20250630_184733_job5450115/figures",
+    "--dropout_rate",
+    "0.01",
+    "--splice_likelihood",
+    "dirichlet_multinomial",
+    "--max_epochs",
+    "2000",
+    "--lr",
+    "1e-5",
+    "--batch_size",
+    "256",
+    "--n_epochs_kl_warmup",
+    "50"
+  ],
+  "program":  "/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/splicevi_utils/runfiles/splicevipartialvae.py",
+  "git":  {
+    "remote":  "https://github.com/smritivaidyanathan/scvi-tools-splicing.git",
+    "commit":  "d9e0216d726122c1e3ed31d2662f23e1fa7a08b6"
+  },
+  "email":  "sv2785@columbia.edu",
+  "root":  "/gpfs/commons/home/svaidyanathan/repos/scvi-tools-splicing",
+  "host":  "ne1dg6-006.nygenome.org",
+  "executable":  "/gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/bin/python",
+  "cpu_count":  24,
+  "cpu_count_logical":  48,
+  "gpu":  "NVIDIA L40S",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "476508585984",
+      "used":  "24286179328"
+    }
+  },
+  "memory":  {
+    "total":  "405091135488"
+  },
+  "cpu":  {
+    "count":  24,
+    "countLogical":  48
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA L40S",
+      "memoryTotal":  "48305799168",
+      "cudaCores":  18176,
+      "architecture":  "Ada"
+    }
+  ],
+  "slurm":  {
+    "cluster_name":  "ne1",
+    "conf":  "/etc/slurm/slurm.conf",
+    "cpus_on_node":  "1",
+    "gpus_on_node":  "1",
+    "gtids":  "0",
+    "job_account":  "dklab",
+    "job_cpus_per_node":  "1",
+    "job_end_time":  "1751496453",
+    "job_gid":  "9072",
+    "job_gpus":  "0",
+    "job_id":  "5450115",
+    "job_name":  "Splice_VI_PartialVAE_Training",
+    "job_nodelist":  "ne1dg6-006",
+    "job_num_nodes":  "1",
+    "job_partition":  "gpu",
+    "job_qos":  "dklab",
+    "job_start_time":  "1751323653",
+    "job_uid":  "91877",
+    "job_user":  "svaidyanathan",
+    "jobid":  "5450115",
+    "localid":  "0",
+    "mem_per_node":  "153600",
+    "nnodes":  "1",
+    "nodeid":  "0",
+    "nodelist":  "ne1dg6-006",
+    "prio_process":  "0",
+    "procid":  "0",
+    "submit_dir":  "/gpfs/commons/home/svaidyanathan/repos/scvi-tools-splicing",
+    "submit_host":  "ne1-login01.nygenome.org",
+    "task_pid":  "2762353",
+    "tasks_per_node":  "1",
+    "topology_addr":  "ne1dg6-006",
+    "topology_addr_pattern":  "node"
+  },
+  "cudaVersion":  "12.4"
+}
