@@ -397,6 +397,107 @@ import torch.nn.functional as F
 from typing import Iterable
 
 
+import torch
+from torch import nn
+from collections.abc import Iterable
+from scvi.nn import FCLayers
+
+# class PartialEncoder(nn.Module):
+#     def __init__(
+#         self,
+#         input_dim: int,
+#         code_dim: int,
+#         h_hidden_dim: int,
+#         encoder_hidden_dim: int,
+#         latent_dim: int,
+#         dropout_rate: float = 0.0,
+#         n_cat_list: Iterable[int] | None = None,
+#         n_cont: int = 0,
+#         inject_covariates: bool = True,
+#     ):
+#         super().__init__()
+#         # keep track of how many one-hot cats and cont features
+#         self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+#         self.n_cont = n_cont
+#         self.inject_covariates = inject_covariates
+#         total_cov = sum(self.n_cat_list) + self.n_cont
+#         self.code_dim = code_dim
+
+#         # per-feature embeddings
+#         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+#         # shared h-network only sees [x_d, F_d]
+#         in_dim = 1 + code_dim
+#         self.h_layer = nn.Sequential(
+#             nn.Linear(in_dim, h_hidden_dim),
+#             nn.LayerNorm(h_hidden_dim),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate),
+#             nn.Linear(h_hidden_dim, code_dim),
+#             nn.LayerNorm(code_dim),
+#             nn.ReLU(),
+#         )
+
+#         # ——— replace manual MLP with FCLayers ———
+#         # note: n_in = code_dim; FCLayers will handle covariates internally
+#         self.encoder_mlp = FCLayers(
+#             n_in=code_dim,
+#             n_out=2 * latent_dim,
+#             n_cat_list=n_cat_list or [],
+#             n_cont=n_cont,
+#             n_layers=2,                    # [code_dim] -> [encoder_hidden_dim] -> [2*latent_dim]
+#             n_hidden=encoder_hidden_dim,
+#             dropout_rate=dropout_rate,
+#             use_batch_norm=False,          # your original used LayerNorm not BatchNorm
+#             use_layer_norm=True,
+#             inject_covariates=inject_covariates,
+#         )
+
+#     def forward(
+#         self,
+#         x: torch.Tensor,                # (B, D)
+#         mask: torch.Tensor,             # (B, D)
+#         *cat_list: torch.Tensor,        # each (B,1)
+#         cont: torch.Tensor | None = None,  # (B, n_cont)
+#     ) -> tuple[torch.Tensor, torch.Tensor]:
+#         B, D = x.shape
+
+#         # --- step 1: flatten features for per-feature h_layer ---
+#         x_flat = x.reshape(-1, 1)  # (B*D,1)
+#         F_embed = (
+#             self.feature_embedding
+#                 .unsqueeze(0)       # (1,D,code_dim)
+#                 .expand(B, D, -1)    # (B,D,code_dim)
+#                 .reshape(-1, self.feature_embedding.size(1))  # (B*D,code_dim)
+#         )
+
+#         # --- step 2: shared h_layer on [x_flat, F_embed] only ---
+#         h_in = torch.cat([x_flat, F_embed], dim=1)  # (B*D, 1+code_dim)
+#         h_out = self.h_layer(h_in).view(B, D, -1)    # (B, D, code_dim)
+
+#         # --- step 3: transformer‐based aggregation ---
+#         # build padding mask: True=positions to ignore
+#         # nn.TransformerEncoderLayer with batch_first=True wants a (B, D, C) input
+#         # and src_key_padding_mask of shape (B, D) with True where we want to mask
+#         padding_mask = (mask == 0)
+
+#         # apply the transformer layer
+#         # output shape is (B, D, code_dim)
+
+#         tr_out = h_out
+
+#         # now pool across the D dimension (e.g. simple masked mean again)
+#         mask_exp = mask.unsqueeze(-1).float()                 # (B, D, 1)
+#         c = (tr_out * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-8)
+
+#         # --- step 4: now pass the output into our mlp (FC layers handles cont and cat covariates automatically) ---
+#         mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # -> (B, 2*latent_dim)
+#         mu, logvar = mu_logvar.chunk(2, dim=-1)
+#         return mu, logvar
+
+
+
+
 class PartialEncoder(nn.Module):
     def __init__(
         self,
@@ -409,10 +510,6 @@ class PartialEncoder(nn.Module):
         n_cat_list: Iterable[int] | None = None,
         n_cont: int = 0,
         inject_covariates: bool = True,
-        n_heads: int = 4,              # how many attention heads
-        ff_dim: int | None = None,     # inner dim of the FFN
-        use_transformer: bool = False,
-        linformer_k: int = 512,
     ):
         super().__init__()
         # keep track of how many one-hot cats and cont features
@@ -421,22 +518,6 @@ class PartialEncoder(nn.Module):
         self.inject_covariates = inject_covariates
         total_cov = sum(self.n_cat_list) + self.n_cont
         self.code_dim = code_dim
-        self.use_transformer = use_transformer
-        self.linformer_k = linformer_k
-
-        ff_dim = ff_dim or (code_dim * 4)
-
-        # replace masked‐mean with a transformer encoder layer
-        if self.use_transformer:
-            print(f"Using Transformer Layer with Linformer k = {self.linformer_k}")
-            self.transformer_layer = LinformerEncoderLayer(
-                embed_dim=code_dim,
-                num_heads=n_heads,
-                k= self.linformer_k,  # or whatever k you want; k < D
-                dim_feedforward=ff_dim,
-                dropout=dropout_rate,
-                max_seq_len=input_dim
-            )
 
         # per-feature embeddings
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
@@ -451,6 +532,12 @@ class PartialEncoder(nn.Module):
             nn.Linear(h_hidden_dim, code_dim),
             nn.LayerNorm(code_dim),
             nn.ReLU(),
+        )
+
+        self.gate_net = nn.Sequential(
+            nn.Linear(code_dim, code_dim // 2),
+            nn.ReLU(),
+            nn.Linear(code_dim // 2, 1),
         )
 
         # ——— replace manual MLP with FCLayers ———
@@ -490,26 +577,319 @@ class PartialEncoder(nn.Module):
         h_in = torch.cat([x_flat, F_embed], dim=1)  # (B*D, 1+code_dim)
         h_out = self.h_layer(h_in).view(B, D, -1)    # (B, D, code_dim)
 
-        # --- step 3: transformer‐based aggregation ---
-        # build padding mask: True=positions to ignore
-        # nn.TransformerEncoderLayer with batch_first=True wants a (B, D, C) input
-        # and src_key_padding_mask of shape (B, D) with True where we want to mask
-        padding_mask = (mask == 0)
+        # ─── step 3: compute per-junction gate scores ───────────────────
+        # raw_gates: (B, D, 1)
+        raw_gates = self.gate_net(h_out)  
+        # mask out missing junctions so they get zero weight
+        #raw_gates = raw_gates.masked_fill((mask == 0).unsqueeze(-1), float('-1e9'))
+        # normalize to [0,1] sum to 1 across D
+        weights = torch.softmax(raw_gates.squeeze(-1), dim=1)  # (B, D)
 
-        # apply the transformer layer
-        # output shape is (B, D, code_dim)
-        if self.use_transformer:
-            tr_out = self.transformer_layer(h_out, src_key_padding_mask=padding_mask)  # shape: (B, D, code_dim)
-        else:
-            tr_out = h_out
-        # now pool across the D dimension (e.g. simple masked mean again)
-        mask_exp = mask.unsqueeze(-1).float()                 # (B, D, 1)
-        c = (tr_out * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-8)
+        # ─── step 4: weighted sum instead of mean ──────────────────────
+        # bring weights to (B, D, 1) to match h_out
+        w_exp = weights.unsqueeze(-1)  
+        # c = Σ_j w_{b,j} * h_out[b,j,:]
+        c = (h_out * w_exp).sum(dim=1)  
 
-        # --- step 4: now pass the output into our mlp (FC layers handles cont and cat covariates automatically) ---
-        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # -> (B, 2*latent_dim)
+        # ─── step 5: your encoder MLP as before ────────────────────────
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
         mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
+
+class PartialEncoderImpute(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,           
+        code_dim: int,
+        h_hidden_dim: int,
+        latent_dim: int,
+        encoder_hidden_dim: int,      # ← re-introduced
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+    ):
+        super().__init__()
+        # per-junction embedding
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+        self.code_dim = code_dim
+        # combine [psi_value, embedding] → code_dim
+        self.h_layer = nn.Sequential(
+            nn.Linear(1 + code_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(h_hidden_dim, code_dim),
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
+        )
+        # collapse code_dim → 1 scalar ∈ [0,1]
+        self.impute_net = nn.Sequential(
+            nn.Linear(code_dim, code_dim // 2),
+            nn.ReLU(),
+            nn.Linear(code_dim // 2, 1),
+            nn.Sigmoid(),
+        )
+        # now our “new x” has shape (B, D) → feed into encoder_mlp
+        self.encoder_mlp = FCLayers(
+            n_in       = input_dim,
+            n_out      = 2 * latent_dim,
+            n_cat_list = list(n_cat_list or []),
+            n_cont     = n_cont,
+            n_layers   = 2,
+            n_hidden   = encoder_hidden_dim,  # use your passed-in hidden size    
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,    # (B, D)
+        mask: torch.Tensor, # (B, D)
+        *cat_list,
+        cont: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, D = x.shape
+        # 1) build per-junction features
+        x_flat  = x.reshape(-1,1)                              # (B*D,1)
+        F_flat  = self.feature_embedding.unsqueeze(0)          # (1,D,code_dim)
+        F_flat  = F_flat.expand(B, D, -1).reshape(-1, F_flat.size(-1))  # (B*D,code_dim)
+        h_in    = torch.cat([x_flat, F_flat], dim=1)           # (B*D,1+code_dim)
+
+        # 2) per-junction embedding → (B, D, code_dim)
+        h_out   = self.h_layer(h_in).view(B, D, -1)
+
+        # 3) collapse each code_dim vector to a scalar ∈ [0,1]
+        x_imp   = self.impute_net(h_out).squeeze(-1)           # (B, D)
+
+        # 4) optional: keep original where observed
+        # x_imp = x_imp * (1-mask) + x * mask
+
+        # 5) feed your original encoder MLP on shape (B, D)
+        mu_logvar = self.encoder_mlp(x_imp, *cat_list, cont=cont)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
+
+
+
+class PartialEncoderTransformer(nn.Module):
+    """
+    Transformer-based encoder that embeds every possible junction,
+    attends over the subset observed in each cell, then maps the
+    aggregated representation to VAE latent parameters (μ, log σ²).
+
+    Args
+    ----
+    input_dim : int
+        Number of distinct junctions J.
+    code_dim : int
+        Size D of each learned junction embedding.
+    latent_dim : int
+        Size Z of the downstream latent space.
+    encoder_hidden_dim : int
+        Hidden width inside the two-layer MLP that produces [μ‖log σ²].
+    dropout_rate : float
+        Dropout used inside Transformer feed-forward blocks.
+    n_cat_list : Iterable[int] | None
+        Sizes of one-hot categorical covariates (e.g. batch).
+    n_cont : int
+        Number of continuous covariates.
+    inject_covariates : bool
+        Whether FCLayers should append covariates to the first layer.
+    n_heads : int
+        Number of self-attention heads.
+    ff_dim : int | None
+        Inner width of Transformer feed-forward network; defaults to 4×D.
+    num_transformer_layers : int
+        How many encoder layers to stack.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        latent_dim: int,
+        encoder_hidden_dim: int,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        n_heads: int = 2,
+        ff_dim: int | None = None,
+        num_transformer_layers: int = 1,
+    ):
+        super().__init__()
+
+        # ------------------------------------------------------------------ #
+        # 1. Junction “identity” embeddings                                  #
+        # ------------------------------------------------------------------ #
+        self.feature_embedding = nn.Parameter(
+            torch.empty(input_dim, code_dim)
+        )
+        self.code_dim = code_dim
+        nn.init.xavier_uniform_(self.feature_embedding)  # swap in PCA init if available
+
+        # ------------------------------------------------------------------ #
+        # 2. Transformer over observed-junction tokens                       #
+        # ------------------------------------------------------------------ #
+        ff_dim = ff_dim or (code_dim * 4)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=code_dim,
+            nhead=n_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout_rate,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_transformer_layers
+        )
+
+        # ------------------------------------------------------------------ #
+        # 3. MLP → latent μ, logσ²                                           #
+        # ------------------------------------------------------------------ #
+        self.encoder_mlp = FCLayers(
+            n_in=code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=list(n_cat_list or []),
+            n_cont=n_cont,
+            n_layers=2,
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+    # ---------------------------------------------------------------------- #
+    # Forward                                                                #
+    # ---------------------------------------------------------------------- #
+    # def forward(
+    #     self,
+    #     x: torch.Tensor,          # (B, J)   – PSI / expression values ∈ [0, 1]
+    #     mask: torch.Tensor,       # (B, J)   – 1 where observed
+    #     *cat_list: torch.Tensor,  # optional categorical covariates
+    #     cont: torch.Tensor | None = None,  # optional continuous covariates
+    # ) -> tuple[torch.Tensor, torch.Tensor]:
+    #     """
+    #     Returns
+    #     -------
+    #     mu, logvar : (B, Z) tensors
+    #         Mean and log-variance of q(z | x) for each cell.
+    #     """
+    #     B, J = x.shape
+    #     device = x.device
+    #     cell_reprs = []
+
+    #     for b in range(B):
+    #         obs_idx = mask[b].nonzero(as_tuple=False).squeeze(1)  # (n_obs,)
+    #         if obs_idx.numel() == 0:
+    #             # If a cell somehow has no observed junctions, fall back to zeros
+    #             cell_reprs.append(torch.zeros(self.feature_embedding.size(1),
+    #                                           device=device))
+    #             continue
+
+    #         # (n_obs, D) embeddings × scalar PSI
+    #         tokens = (
+    #             self.feature_embedding[obs_idx] *
+    #             x[b, obs_idx].unsqueeze(-1)
+    #         )  # shape (n_obs, D)
+
+    #         # Transformer expects (batch, seq, dim)
+    #         attended = self.transformer(tokens.unsqueeze(0))  # (1, n_obs, D)
+
+    #         # Mean-pool over the variable-length sequence → (D,)
+    #         cell_repr = attended.mean(dim=1).squeeze(0)
+    #         cell_reprs.append(cell_repr)
+
+    #     # Stack back into (B, D)
+    #     c = torch.stack(cell_reprs, dim=0)
+
+    #     # Project to latent parameters
+    #     mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
+    #     mu, logvar = mu_logvar.chunk(2, dim=-1)
+    #     return mu, logvar
+
+    def forward(
+        self,
+        x: torch.Tensor,              # (B, J)
+        mask: torch.Tensor,           # (B, J)
+        *cat_list: torch.Tensor,
+        cont: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # --- call counter to limit prints ---
+        if not hasattr(self, "_fw_calls"):
+            self._fw_calls = 0
+        self._fw_calls += 1
+        do_print = self._fw_calls <= 10
+
+        import time
+        t0 = time.time()
+
+        B, J = x.shape
+        device = x.device
+
+        # 1) compute lengths and update max_obs
+        t1 = time.time()
+        mask_long = mask.to(torch.long)           # (B, J)
+        lengths   = mask_long.sum(dim=1)          # (B,)
+        batch_max = int(lengths.max().item())
+        if not hasattr(self, "max_obs"):
+            self.max_obs = batch_max
+        else:
+            self.max_obs = max(self.max_obs, batch_max)
+        L = self.max_obs
+        t2 = time.time()
+
+        # 2) topk indices
+        _, idxs = mask_long.topk(L, dim=1)        # (B, L)
+        t3 = time.time()
+
+        # 3) gather embeddings & weights
+        emb_tokens = self.feature_embedding[idxs]            # (B, L, D)
+        x_weights  = x.gather(1, idxs).unsqueeze(-1)         # (B, L, 1)
+        tokens     = emb_tokens * x_weights                  # (B, L, D)
+        t4 = time.time()
+
+        # 4) build pad mask
+        pad_mask = (
+            torch.arange(L, device=device)[None, :].expand(B, L)
+            >= lengths[:, None]
+        )                                                    # (B, L)
+        t5 = time.time()
+
+        # 5) transformer
+        out = self.transformer(tokens, src_key_padding_mask=pad_mask)
+        t6 = time.time()
+
+        # 6) masked mean‐pool
+        keep   = (~pad_mask).unsqueeze(-1).float()           # (B, L, 1)
+        summed = (out * keep).sum(dim=1)                     # (B, D)
+        c      = summed / (lengths.unsqueeze(-1).float() + 1e-8)
+        t7 = time.time()
+
+        # 7) MLP → [μ‖log σ²]
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        t8 = time.time()
+
+        # print timing breakdown for first few forwards
+        # ── print timing + max_obs for first few forwards ─────────────────
+        if do_print:
+            print(
+                f"[Forward #{self._fw_calls}] total={t8-t0:.4f}s  "
+                f"max_obs={self.max_obs}  "
+                f"len={t2-t1:.4f}s  topk={t3-t2:.4f}s  "
+                f"gather={t4-t3:.4f}s  mask={t5-t4:.4f}s  "
+                f"transform={t6-t5:.4f}s  pool={t7-t6:.4f}s  "
+                f"mlp={t8-t7:.4f}s"
+            )
+
+        return mu, logvar
+
+
+
 
 
 class LinearDecoder(nn.Module):
@@ -624,8 +1004,10 @@ class PARTIALVAE(BaseModuleClass):
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
         learn_concentration: bool = True,
-        use_transformer: bool = False,
-        linformer_k: int = 512,
+        n_heads: int = 4,
+        ff_dim: int | None = None,
+        num_transformer_layers: int = 2,
+        use_transformer: bool = False
     ):
         super().__init__()
 
@@ -657,7 +1039,25 @@ class PARTIALVAE(BaseModuleClass):
             self.log_concentration = None
 
         # Instantiate encoder + decoder, passing covariate specs
-        self.encoder = PartialEncoder(
+
+        if (use_transformer):
+            print ("Using Transformer Version")
+            self.encoder = PartialEncoderTransformer(
+                input_dim=n_input,
+                code_dim=code_dim,
+                encoder_hidden_dim=encoder_hidden_dim,
+                latent_dim=n_latent,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                n_heads = n_heads,
+                ff_dim= ff_dim,
+                num_transformer_layers = num_transformer_layers,
+            )
+        else:
+            print ("Using Vanilla Version (Impute)")
+            self.encoder = PartialEncoderImpute(
             input_dim=n_input,
             code_dim=code_dim,
             h_hidden_dim=h_hidden_dim,
@@ -667,9 +1067,8 @@ class PARTIALVAE(BaseModuleClass):
             n_cat_list=encoder_cat_list,
             n_cont=n_continuous_cov,
             inject_covariates=encode_covariates,
-            use_transformer = use_transformer,
-            linformer_k = linformer_k,
-        )
+            )
+            
         if latent_distribution == "ln":
             self.encoder.z_transformation = nn.Softmax(dim=-1)
         else:
@@ -842,7 +1241,8 @@ class PARTIALVAE(BaseModuleClass):
             # concentration scalar fixed at 10.0 for now
             
             concentration = torch.exp(self.log_concentration)
-            print(f"[DM ϕ] concentration = {concentration.item():.4f}")
+            if torch.rand(1).item() < 1e-6:
+                print(f"[DM ϕ] concentration = {concentration.item():.4f}")
 
             # --- turn logits into per‐group softmax‐logits ---
             # group_logsumexp and subtract_group_logsumexp expect (N,P)→(N,G)

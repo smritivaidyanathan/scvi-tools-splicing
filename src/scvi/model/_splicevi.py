@@ -83,7 +83,6 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         deeply_inject_covariates: bool = True,
         initialize_embeddings_from_pca: bool = True,
         use_transformer: bool = False,
-        linformer_k: int = 512,
         **kwargs,
     ):
         super().__init__(adata)
@@ -101,7 +100,6 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             encode_covariates=encode_covariates,
             deeply_inject_covariates=deeply_inject_covariates,
             use_transformer=use_transformer,
-            linformer_k=linformer_k,
             **kwargs,
         )
 
@@ -117,7 +115,6 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             f"deeply_inject_covariates={deeply_inject_covariates}, "
             f"initialize_embeddings_from_pca={initialize_embeddings_from_pca}, "
             f"use_transformer={use_transformer}, "
-            f"linformer_k={linformer_k}, "
 
             "."
         )
