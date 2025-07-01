@@ -65,4 +65,4 @@ HPU available: False, using: 0 HPUs
 You are using a CUDA device ('NVIDIA L40S') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
 /gpfs/commons/home/svaidyanathan/miniconda3/envs/scvi-env/lib/python3.12/site-packages/pytorch_lightning/loggers/wandb.py:397: There is a wandb run already in progress and newly created instances of `WandbLogger` will reuse this run. If this is not desired, call `wandb.finish()` before instantiating `WandbLogger`.
 LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
-Epoch 522/2000:  26%|██▌       | 521/2000 [19:46:38<56:03:54, 136.47s/it, v_num=kk3w, train_loss_step=5.48e+3, train_loss_epoch=5.76e+3]
+Epoch 639/2000:  32%|███▏      | 638/2000 [24:11:29<50:56:30, 134.65s/it, v_num=kk3w, train_loss_step=5.5e+3, train_loss_epoch=5.3e+3]  

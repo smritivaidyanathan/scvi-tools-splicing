@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 logger = logging.getLogger(__name__)
+import pandas as pd 
 
 
 class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
@@ -406,6 +407,73 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         )
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
+
+    # add at top of file alongside np, torch, etc.
+
+    # … inside your SPLICEVI class …
+
+    @torch.inference_mode()
+    def get_normalized_splicing(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        use_z_mean: bool = True,
+        n_samples: int = 1,
+        batch_size: int | None = None,
+        return_numpy: bool = False,
+        silent: bool = True,
+    ) -> np.ndarray | pd.DataFrame:
+        """
+        Return the decoded splicing probabilities p_nj = sigmoid(decoder_logits).
+
+        Parameters
+        ----------
+        adata
+            AnnData for inference (defaults to the one used at init).
+        indices
+            Which cells to pull (default: all).
+        use_z_mean
+            If True, run generative with use_z_mean=True.
+        n_samples
+            How many posterior samples to draw (passed to inference).
+        batch_size
+            Mini-batch size (defaults to scvi.settings.batch_size).
+        return_numpy
+            If True, returns a (n_cells, n_junctions) numpy array;
+            otherwise returns a DataFrame with var_names as columns.
+        silent
+            If False, shows a little progress info.
+
+        Returns
+        -------
+        Array or DataFrame of shape (cells, junctions) of decoded probabilities.
+        """
+        adata = self._validate_anndata(adata)
+        # pick all cells if nothing specified
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        # build loader
+        dl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+        all_spls = []
+        for tensors in dl:
+            # 1) inference
+            inf_inputs = self.module._get_inference_input(tensors)
+            inf_out = self.module.inference(**inf_inputs, n_samples=n_samples)
+            # 2) generative
+            gen_inputs = self.module._get_generative_input(tensors, inf_out)
+            gen_out = self.module.generative(**gen_inputs, use_z_mean=use_z_mean)
+            logits = gen_out["reconstruction"]  # (batch, n_junctions)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_spls.append(probs)
+        # concat back
+        spls = np.concatenate(all_spls, axis=0)  # (n_cells, n_junctions)
+        if return_numpy:
+            return spls
+        # otherwise DataFrame
+        cols = adata.var_names
+        idx = adata.obs_names[indices]
+        return pd.DataFrame(spls, index=idx, columns=cols)
+
 
     @torch.inference_mode()
     def get_latent_representation(

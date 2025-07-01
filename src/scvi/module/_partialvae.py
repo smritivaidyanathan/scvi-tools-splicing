@@ -634,6 +634,7 @@ class PartialEncoderImpute(nn.Module):
         # per-junction embedding
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
         self.code_dim = code_dim
+        self.finished_training = False
         self.junction_inclusion = junction_inclusion
         if self.junction_inclusion == "observed_junctions":
             "Only Imputing for Non Observed Junctions"
@@ -689,6 +690,16 @@ class PartialEncoderImpute(nn.Module):
 
         # 3) collapse each code_dim vector to a scalar ∈ [0,1]
         x_imp   = self.impute_net(h_out).squeeze(-1)           # (B, D)
+
+
+        # only compute & print Pearson‐R when in eval mode, once
+        if self.finished_training and not hasattr(self, "_corr_printed"):
+            orig = x.reshape(-1)
+            pred = x_imp.reshape(-1)
+            vx, vy = orig - orig.mean(), pred - pred.mean()
+            corr = (vx * vy).sum() / torch.sqrt((vx**2).sum() * (vy**2).sum() + 1e-8)
+            print(f"[Eval] impute_net PearsonR = {corr.item():.4f}")
+            self._corr_printed = True
 
         # 4) optional: keep original where observed
         if self.junction_inclusion == "observed_junctions":
