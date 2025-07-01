@@ -5,3 +5,5 @@
 {"time":"2025-06-30T19:00:52.091725185-04:00","level":"INFO","msg":"handler: started","stream_id":"nlpbkk3w"}
 {"time":"2025-06-30T19:00:52.091765415-04:00","level":"INFO","msg":"sender: started","stream_id":"nlpbkk3w"}
 {"time":"2025-06-30T19:00:52.274771151-04:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-07-01T07:23:52.13010866-04:00","level":"INFO","msg":"api: retrying HTTP error","status":500,"url":"https://api.wandb.ai/files/sv2785-columbia-university/splicevi-partialvae/nlpbkk3w/file_stream","body":"{\"error\":\"context deadline exceeded\"}"}
+{"time":"2025-07-01T12:33:40.581051625-04:00","level":"INFO","msg":"api: retrying HTTP error","status":502,"url":"https://api.wandb.ai/files/sv2785-columbia-university/splicevi-partialvae/nlpbkk3w/file_stream","body":"\n<html><head>\n<meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n<title>502 Server Error</title>\n</head>\n<body text=#000000 bgcolor=#ffffff>\n<h1>Error: Server Error</h1>\n<h2>The server encountered a temporary error and could not complete your request.<p>Please try again in 30 seconds.</h2>\n<h2></h2>\n</body></html>\n"}

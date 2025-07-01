@@ -402,102 +402,6 @@ from torch import nn
 from collections.abc import Iterable
 from scvi.nn import FCLayers
 
-# class PartialEncoder(nn.Module):
-#     def __init__(
-#         self,
-#         input_dim: int,
-#         code_dim: int,
-#         h_hidden_dim: int,
-#         encoder_hidden_dim: int,
-#         latent_dim: int,
-#         dropout_rate: float = 0.0,
-#         n_cat_list: Iterable[int] | None = None,
-#         n_cont: int = 0,
-#         inject_covariates: bool = True,
-#     ):
-#         super().__init__()
-#         # keep track of how many one-hot cats and cont features
-#         self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
-#         self.n_cont = n_cont
-#         self.inject_covariates = inject_covariates
-#         total_cov = sum(self.n_cat_list) + self.n_cont
-#         self.code_dim = code_dim
-
-#         # per-feature embeddings
-#         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
-
-#         # shared h-network only sees [x_d, F_d]
-#         in_dim = 1 + code_dim
-#         self.h_layer = nn.Sequential(
-#             nn.Linear(in_dim, h_hidden_dim),
-#             nn.LayerNorm(h_hidden_dim),
-#             nn.ReLU(),
-#             nn.Dropout(dropout_rate),
-#             nn.Linear(h_hidden_dim, code_dim),
-#             nn.LayerNorm(code_dim),
-#             nn.ReLU(),
-#         )
-
-#         # ——— replace manual MLP with FCLayers ———
-#         # note: n_in = code_dim; FCLayers will handle covariates internally
-#         self.encoder_mlp = FCLayers(
-#             n_in=code_dim,
-#             n_out=2 * latent_dim,
-#             n_cat_list=n_cat_list or [],
-#             n_cont=n_cont,
-#             n_layers=2,                    # [code_dim] -> [encoder_hidden_dim] -> [2*latent_dim]
-#             n_hidden=encoder_hidden_dim,
-#             dropout_rate=dropout_rate,
-#             use_batch_norm=False,          # your original used LayerNorm not BatchNorm
-#             use_layer_norm=True,
-#             inject_covariates=inject_covariates,
-#         )
-
-#     def forward(
-#         self,
-#         x: torch.Tensor,                # (B, D)
-#         mask: torch.Tensor,             # (B, D)
-#         *cat_list: torch.Tensor,        # each (B,1)
-#         cont: torch.Tensor | None = None,  # (B, n_cont)
-#     ) -> tuple[torch.Tensor, torch.Tensor]:
-#         B, D = x.shape
-
-#         # --- step 1: flatten features for per-feature h_layer ---
-#         x_flat = x.reshape(-1, 1)  # (B*D,1)
-#         F_embed = (
-#             self.feature_embedding
-#                 .unsqueeze(0)       # (1,D,code_dim)
-#                 .expand(B, D, -1)    # (B,D,code_dim)
-#                 .reshape(-1, self.feature_embedding.size(1))  # (B*D,code_dim)
-#         )
-
-#         # --- step 2: shared h_layer on [x_flat, F_embed] only ---
-#         h_in = torch.cat([x_flat, F_embed], dim=1)  # (B*D, 1+code_dim)
-#         h_out = self.h_layer(h_in).view(B, D, -1)    # (B, D, code_dim)
-
-#         # --- step 3: transformer‐based aggregation ---
-#         # build padding mask: True=positions to ignore
-#         # nn.TransformerEncoderLayer with batch_first=True wants a (B, D, C) input
-#         # and src_key_padding_mask of shape (B, D) with True where we want to mask
-#         padding_mask = (mask == 0)
-
-#         # apply the transformer layer
-#         # output shape is (B, D, code_dim)
-
-#         tr_out = h_out
-
-#         # now pool across the D dimension (e.g. simple masked mean again)
-#         mask_exp = mask.unsqueeze(-1).float()                 # (B, D, 1)
-#         c = (tr_out * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-8)
-
-#         # --- step 4: now pass the output into our mlp (FC layers handles cont and cat covariates automatically) ---
-#         mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # -> (B, 2*latent_dim)
-#         mu, logvar = mu_logvar.chunk(2, dim=-1)
-#         return mu, logvar
-
-
-
-
 class PartialEncoder(nn.Module):
     def __init__(
         self,
@@ -510,6 +414,7 @@ class PartialEncoder(nn.Module):
         n_cat_list: Iterable[int] | None = None,
         n_cont: int = 0,
         inject_covariates: bool = True,
+        pool_mode: Literal["mean","sum"] = "mean",
     ):
         super().__init__()
         # keep track of how many one-hot cats and cont features
@@ -518,6 +423,118 @@ class PartialEncoder(nn.Module):
         self.inject_covariates = inject_covariates
         total_cov = sum(self.n_cat_list) + self.n_cont
         self.code_dim = code_dim
+        self.pool_mode = pool_mode
+
+        print(f"pool_mode: {pool_mode}")
+
+        # per-feature embeddings
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+        # shared h-network only sees [x_d, F_d]
+        in_dim = 1 + code_dim
+        self.h_layer = nn.Sequential(
+            nn.Linear(in_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(h_hidden_dim, code_dim),
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
+        )
+
+        # ——— replace manual MLP with FCLayers ———
+        # note: n_in = code_dim; FCLayers will handle covariates internally
+        self.encoder_mlp = FCLayers(
+            n_in=code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=n_cat_list or [],
+            n_cont=n_cont,
+            n_layers=2,                    # [code_dim] -> [encoder_hidden_dim] -> [2*latent_dim]
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,          # your original used LayerNorm not BatchNorm
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,                # (B, D)
+        mask: torch.Tensor,             # (B, D)
+        *cat_list: torch.Tensor,        # each (B,1)
+        cont: torch.Tensor | None = None,  # (B, n_cont)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, D = x.shape
+
+        # --- step 1: flatten features for per-feature h_layer ---
+        x_flat = x.reshape(-1, 1)  # (B*D,1)
+        F_embed = (
+            self.feature_embedding
+                .unsqueeze(0)       # (1,D,code_dim)
+                .expand(B, D, -1)    # (B,D,code_dim)
+                .reshape(-1, self.feature_embedding.size(1))  # (B*D,code_dim)
+        )
+
+        # --- step 2: shared h_layer on [x_flat, F_embed] only ---
+        h_in = torch.cat([x_flat, F_embed], dim=1)  # (B*D, 1+code_dim)
+        h_out = self.h_layer(h_in).view(B, D, -1)    # (B, D, code_dim)
+
+        # --- step 3: transformer‐based aggregation ---
+        # build padding mask: True=positions to ignore
+        # nn.TransformerEncoderLayer with batch_first=True wants a (B, D, C) input
+        # and src_key_padding_mask of shape (B, D) with True where we want to mask
+        padding_mask = (mask == 0)
+
+        # apply the transformer layer
+        # output shape is (B, D, code_dim)
+
+        tr_out = h_out
+
+        # now pool across the D dimension
+        mask_exp = mask.unsqueeze(-1).float()  # (B, D, 1)
+        summed = (tr_out * mask_exp).sum(dim=1)
+        if self.pool_mode == "mean":
+            # divide by # observed junctions
+            counts = mask_exp.sum(dim=1).clamp(min=1e-8)
+            c = summed / counts
+        else:
+            # just sum
+            c = summed
+
+        # --- step 4: now pass the output into our mlp (FC layers handles cont and cat covariates automatically) ---
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # -> (B, 2*latent_dim)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
+
+
+
+
+class PartialEncoderWeightedSum(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        junction_inclusion: str = "all_junctions",
+    ):
+        super().__init__()
+        # keep track of how many one-hot cats and cont features
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        total_cov = sum(self.n_cat_list) + self.n_cont
+        self.code_dim = code_dim
+        self.junction_inclusion = junction_inclusion
+        if self.junction_inclusion == "all_junctions":
+            print("Including all junctions into weighted sum")
+        elif self.junction_inclusion == "observed_junctions":
+            print("Only Including observed junctions into weighted sum")
 
         # per-feature embeddings
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
@@ -580,8 +597,11 @@ class PartialEncoder(nn.Module):
         # ─── step 3: compute per-junction gate scores ───────────────────
         # raw_gates: (B, D, 1)
         raw_gates = self.gate_net(h_out)  
-        # mask out missing junctions so they get zero weight
-        #raw_gates = raw_gates.masked_fill((mask == 0).unsqueeze(-1), float('-1e9'))
+
+        if self.junction_inclusion == "observed_junctions":
+            #mask out missing junctions so they get zero weight
+            raw_gates = raw_gates.masked_fill((mask == 0).unsqueeze(-1), float('-1e9'))
+
         # normalize to [0,1] sum to 1 across D
         weights = torch.softmax(raw_gates.squeeze(-1), dim=1)  # (B, D)
 
@@ -608,11 +628,17 @@ class PartialEncoderImpute(nn.Module):
         n_cat_list: Iterable[int] | None = None,
         n_cont: int = 0,
         inject_covariates: bool = True,
+        junction_inclusion: str = "all_junctions",
     ):
         super().__init__()
         # per-junction embedding
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
         self.code_dim = code_dim
+        self.junction_inclusion = junction_inclusion
+        if self.junction_inclusion == "observed_junctions":
+            "Only Imputing for Non Observed Junctions"
+        elif self.junction_inclusion == "all_junctions":
+            "Imputing for All Junctions"
         # combine [psi_value, embedding] → code_dim
         self.h_layer = nn.Sequential(
             nn.Linear(1 + code_dim, h_hidden_dim),
@@ -665,7 +691,9 @@ class PartialEncoderImpute(nn.Module):
         x_imp   = self.impute_net(h_out).squeeze(-1)           # (B, D)
 
         # 4) optional: keep original where observed
-        # x_imp = x_imp * (1-mask) + x * mask
+        if self.junction_inclusion == "observed_junctions":
+            x_imp = x_imp * (1-mask) + x * mask
+            
 
         # 5) feed your original encoder MLP on shape (B, D)
         mu_logvar = self.encoder_mlp(x_imp, *cat_list, cont=cont)
@@ -1007,9 +1035,18 @@ class PARTIALVAE(BaseModuleClass):
         n_heads: int = 4,
         ff_dim: int | None = None,
         num_transformer_layers: int = 2,
-        use_transformer: bool = False
+        encoder_type: Literal[
+            "PartialEncoder",
+            "PartialEncoderImpute",
+            "PartialEncoderWeightedSum",
+            "PartialEncoderTransformer",
+        ] = "PartialEncoder",
+        junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
+        pool_mode: Literal["mean","sum"] = "mean",
     ):
         super().__init__()
+        self.encoder_type = encoder_type
+        self.junction_inclusion = junction_inclusion
 
         # Store high-level flags
         self.encode_covariates = encode_covariates
@@ -1040,8 +1077,51 @@ class PARTIALVAE(BaseModuleClass):
 
         # Instantiate encoder + decoder, passing covariate specs
 
-        if (use_transformer):
-            print ("Using Transformer Version")
+        # instantiate the requested encoder
+        if encoder_type == "PartialEncoder":
+            print(f"Using Regular Partial Encoder")
+            self.encoder = PartialEncoder(
+                input_dim=n_input,
+                code_dim=code_dim,
+                h_hidden_dim=h_hidden_dim,
+                encoder_hidden_dim=encoder_hidden_dim,
+                latent_dim=n_latent,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                pool_mode=pool_mode,
+            )
+        elif encoder_type == "PartialEncoderImpute":
+            print("Using Impute encoder")
+            self.encoder = PartialEncoderImpute(
+                input_dim=n_input,
+                code_dim=code_dim,
+                h_hidden_dim=h_hidden_dim,
+                encoder_hidden_dim=encoder_hidden_dim,
+                latent_dim=n_latent,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                junction_inclusion=junction_inclusion,
+            )
+        elif encoder_type == "PartialEncoderWeightedSum":
+            print("Using WeightedSum encoder")
+            self.encoder = PartialEncoderWeightedSum(
+                input_dim=n_input,
+                code_dim=code_dim,
+                h_hidden_dim=h_hidden_dim,
+                encoder_hidden_dim=encoder_hidden_dim,
+                latent_dim=n_latent,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                junction_inclusion=junction_inclusion,
+            )
+        elif encoder_type == "PartialEncoderTransformer":
+            print("Using Transformer encoder")
             self.encoder = PartialEncoderTransformer(
                 input_dim=n_input,
                 code_dim=code_dim,
@@ -1051,23 +1131,12 @@ class PARTIALVAE(BaseModuleClass):
                 n_cat_list=encoder_cat_list,
                 n_cont=n_continuous_cov,
                 inject_covariates=encode_covariates,
-                n_heads = n_heads,
-                ff_dim= ff_dim,
-                num_transformer_layers = num_transformer_layers,
+                n_heads=n_heads,
+                ff_dim=ff_dim,
+                num_transformer_layers=num_transformer_layers,
             )
         else:
-            print ("Using Vanilla Version (Impute)")
-            self.encoder = PartialEncoderImpute(
-            input_dim=n_input,
-            code_dim=code_dim,
-            h_hidden_dim=h_hidden_dim,
-            encoder_hidden_dim=encoder_hidden_dim,
-            latent_dim=n_latent,
-            dropout_rate=dropout_rate,
-            n_cat_list=encoder_cat_list,
-            n_cont=n_continuous_cov,
-            inject_covariates=encode_covariates,
-            )
+            raise ValueError(f"Unknown encoder_type={encoder_type!r}")
             
         if latent_distribution == "ln":
             self.encoder.z_transformation = nn.Softmax(dim=-1)

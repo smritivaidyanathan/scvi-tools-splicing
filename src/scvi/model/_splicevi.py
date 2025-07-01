@@ -82,7 +82,15 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         encode_covariates: bool = False,
         deeply_inject_covariates: bool = True,
         initialize_embeddings_from_pca: bool = True,
-        use_transformer: bool = False,
+        num_transformer_layers: int = 2,
+        encoder_type: Literal[
+            "PartialEncoder",
+            "PartialEncoderImpute",
+            "PartialEncoderWeightedSum",
+            "PartialEncoderTransformer",
+        ] = "PartialEncoder",
+        junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
+        pool_mode: Literal["mean","sum"]="mean",
         **kwargs,
     ):
         super().__init__(adata)
@@ -99,7 +107,10 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             splice_likelihood=splice_likelihood,
             encode_covariates=encode_covariates,
             deeply_inject_covariates=deeply_inject_covariates,
-            use_transformer=use_transformer,
+            num_transformer_layers=num_transformer_layers,
+            encoder_type = encoder_type,
+            junction_inclusion = junction_inclusion,
+            pool_mode=pool_mode,
             **kwargs,
         )
 
@@ -114,10 +125,9 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             f"encode_covariates={encode_covariates}, "
             f"deeply_inject_covariates={deeply_inject_covariates}, "
             f"initialize_embeddings_from_pca={initialize_embeddings_from_pca}, "
-            f"use_transformer={use_transformer}, "
-
-            "."
+            f"encoder_type={encoder_type}, junction_inclusion={junction_inclusion}, pool_mode={pool_mode}."
         )
+
 
         # 3) If we only initialize module at train time, bail out now
         if self._module_init_on_train:
