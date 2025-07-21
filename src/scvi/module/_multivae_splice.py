@@ -12,7 +12,7 @@ from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial, NegativeBinomialMixture, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers, LinearDecoderSCVI
-from scvi.module._partialvae import PartialEncoder, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
+from scvi.module._partialvae import PartialEncoder, PartialEncoderImpute, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
 
 from ._utils import masked_softmax
 
@@ -353,16 +353,29 @@ class MULTIVAESPLICE(BaseModuleClass):
                 deep_inject_covariates=deeply_inject_covariates,
             )
         else:
-            self.z_encoder_splicing = PartialEncoder(
-            input_dim=input_spl,
-            code_dim=code_dim,
-            h_hidden_dim=h_hidden_dim,
-            encoder_hidden_dim=mlp_encoder_hidden_dim,
-            latent_dim=encoderlatentdim,
-            dropout_rate=dropout_rate,
-            n_cat_list=encoder_cat_list,
-            n_cont=n_continuous_cov,
-            inject_covariates=encode_covariates,
+            # self.z_encoder_splicing = PartialEncoder(
+            # input_dim=input_spl,
+            # code_dim=code_dim,
+            # h_hidden_dim=h_hidden_dim,
+            # encoder_hidden_dim=mlp_encoder_hidden_dim,
+            # latent_dim=encoderlatentdim,
+            # dropout_rate=dropout_rate,
+            # n_cat_list=encoder_cat_list,
+            # n_cont=n_continuous_cov,
+            # inject_covariates=encode_covariates,
+            # )
+
+            self.z_encoder_splicing = PartialEncoderImpute(
+                input_dim=input_spl,
+                code_dim=code_dim,
+                h_hidden_dim=h_hidden_dim,
+                latent_dim=encoderlatentdim,              # latent_dim comes first
+                encoder_hidden_dim=mlp_encoder_hidden_dim,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                junction_inclusion="all_junctions",       # or "observed_junctions"
             )
 
             if latent_distribution == "ln":

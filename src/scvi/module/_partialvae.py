@@ -402,6 +402,98 @@ from torch import nn
 from collections.abc import Iterable
 from scvi.nn import FCLayers
 
+
+class PartialEncoderEDDI(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        pool_mode: Literal["mean","sum"] = "mean",
+    ):
+        super().__init__()
+        # keep track of how many one-hot cats and cont features
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        total_cov = sum(self.n_cat_list) + self.n_cont
+        self.code_dim = code_dim
+        self.pool_mode = pool_mode
+
+        print(f"pool_mode: {pool_mode}")
+
+        # per-feature embeddings
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+        # shared h-network only sees [x_d, F_d]
+        in_dim = 1 + code_dim
+        self.h_layer = nn.Sequential(
+            nn.Linear(in_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(h_hidden_dim, code_dim),
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
+        )
+
+        # ——— replace manual MLP with FCLayers ———
+        # note: n_in = code_dim; FCLayers will handle covariates internally
+        self.encoder_mlp = FCLayers(
+            n_in=code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=n_cat_list or [],
+            n_cont=n_cont,
+            n_layers=2,                    # [code_dim] -> [encoder_hidden_dim] -> [2*latent_dim]
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,          # your original used LayerNorm not BatchNorm
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,       # (B, D)
+        mask: torch.Tensor,    # (B, D)
+        *cat_list: torch.Tensor,
+        cont: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, D = x.shape
+        outputs = []
+
+        for b in range(B):
+            obs_idx = mask[b].bool()  # (D,)
+            x_obs = x[b, obs_idx]     # (n_obs,)
+            F_obs = self.feature_embedding[obs_idx]  # (n_obs, code_dim)
+
+            h_in = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)  # (n_obs, 1 + code_dim)
+            h_out = self.h_layer(h_in)  # (n_obs, code_dim)
+
+            if self.pool_mode == "mean":
+                c = h_out.mean(dim=0)  # (code_dim,)
+            else:
+                c = h_out.sum(dim=0)   # (code_dim,)
+
+            outputs.append(c)
+
+        c = torch.stack(outputs, dim=0)  # (B, code_dim)
+
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # (B, 2*latent_dim)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
+
+
+
+
+
+
 class PartialEncoder(nn.Module):
     def __init__(
         self,
@@ -616,6 +708,115 @@ class PartialEncoderWeightedSum(nn.Module):
         mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
 
+
+
+class PartialEncoderWeightedSumEDDI(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        junction_inclusion: str = "all_junctions",
+    ):
+        super().__init__()
+        # keep track of how many one-hot cats and cont features
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        total_cov = sum(self.n_cat_list) + self.n_cont
+        self.code_dim = code_dim
+        self.junction_inclusion = junction_inclusion
+        if self.junction_inclusion == "all_junctions":
+            print("Including all junctions into weighted sum")
+        elif self.junction_inclusion == "observed_junctions":
+            print("Only Including observed junctions into weighted sum")
+
+        # per-feature embeddings
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+        # shared h-network only sees [x_d, F_d]
+        in_dim = 1 + code_dim
+        self.h_layer = nn.Sequential(
+            nn.Linear(in_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(h_hidden_dim, code_dim),
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
+        )
+
+        self.gate_net = nn.Sequential(
+            nn.Linear(code_dim, code_dim // 2),
+            nn.ReLU(),
+            nn.Linear(code_dim // 2, 1),
+        )
+
+        # ——— replace manual MLP with FCLayers ———
+        # note: n_in = code_dim; FCLayers will handle covariates internally
+        self.encoder_mlp = FCLayers(
+            n_in=code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=n_cat_list or [],
+            n_cont=n_cont,
+            n_layers=2,                    # [code_dim] -> [encoder_hidden_dim] -> [2*latent_dim]
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,          # your original used LayerNorm not BatchNorm
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,                # (B, D)
+        mask: torch.Tensor,             # (B, D)
+        *cat_list: torch.Tensor,        # each (B,1)
+        cont: torch.Tensor | None = None,  # (B, n_cont)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, D = x.shape
+        device = x.device
+        code_dim = self.code_dim
+
+        # Prepare output tensor with zeros for missing junctions
+        h_out_full = torch.zeros((B, D, code_dim), device=device)
+
+        for b in range(B):
+            obs_idx = mask[b].bool()  # (D,)
+            x_obs = x[b, obs_idx]     # (n_obs,)
+            F_obs = self.feature_embedding[obs_idx]  # (n_obs, code_dim)
+
+            h_in = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)  # (n_obs, 1 + code_dim)
+            h_out = self.h_layer(h_in)  # (n_obs, code_dim)
+
+            # Fill observed indices in full output
+            h_out_full[b, obs_idx] = h_out
+
+        # ─── step 3: compute per-junction gate scores ───────────────────
+        raw_gates = self.gate_net(h_out_full)  # (B, D, 1)
+
+        if self.junction_inclusion == "observed_junctions":
+            raw_gates = raw_gates.masked_fill((mask == 0).unsqueeze(-1), float('-1e9'))
+
+        # softmax over junctions D
+        weights = torch.softmax(raw_gates.squeeze(-1), dim=1)  # (B, D)
+
+        # weighted sum as usual
+        w_exp = weights.unsqueeze(-1)  # (B, D, 1)
+        c = (h_out_full * w_exp).sum(dim=1)  # (B, code_dim)
+
+        # ─── step 5: your encoder MLP as before ────────────────────────
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
+
+
 class PartialEncoderImpute(nn.Module):
     def __init__(
         self,
@@ -637,9 +838,9 @@ class PartialEncoderImpute(nn.Module):
         self.finished_training = False
         self.junction_inclusion = junction_inclusion
         if self.junction_inclusion == "observed_junctions":
-            "Only Imputing for Non Observed Junctions"
+            print("Only Imputing for Non Observed Junctions")
         elif self.junction_inclusion == "all_junctions":
-            "Imputing for All Junctions"
+            print("Imputing for All Junctions")
         # combine [psi_value, embedding] → code_dim
         self.h_layer = nn.Sequential(
             nn.Linear(1 + code_dim, h_hidden_dim),
@@ -694,12 +895,31 @@ class PartialEncoderImpute(nn.Module):
 
         # only compute & print Pearson‐R when in eval mode, once
         if self.finished_training and not hasattr(self, "_corr_printed"):
-            orig = x.reshape(-1)
-            pred = x_imp.reshape(-1)
+            orig = x.reshape(-1)               # (B*D,)
+            pred = x_imp.reshape(-1)           # (B*D,)
+
+            # Pearson‐R
             vx, vy = orig - orig.mean(), pred - pred.mean()
             corr = (vx * vy).sum() / torch.sqrt((vx**2).sum() * (vy**2).sum() + 1e-8)
             print(f"[Eval] impute_net PearsonR = {corr.item():.4f}")
+
+            # Quartiles for predictions where original == 0
+            zero_mask = orig == 0
+            if zero_mask.any():
+                # get just the preds where orig was zero
+                preds_zero = pred[zero_mask]
+                # compute 25th, 50th, 75th percentiles
+                qs = torch.quantile(preds_zero, torch.tensor([0.25, 0.50, 0.75], device=pred.device))
+                q25, q50, q75 = qs.tolist()
+                print(
+                    f"[Eval] pred quartiles (orig==0): "
+                    f"25%={q25:.4f}, median={q50:.4f}, 75%={q75:.4f}"
+                )
+            else:
+                print("[Eval] no entries with orig==0 to compute quartiles.")
+
             self._corr_printed = True
+
 
         # 4) optional: keep original where observed
         if self.junction_inclusion == "observed_junctions":
@@ -1050,7 +1270,9 @@ class PARTIALVAE(BaseModuleClass):
             "PartialEncoder",
             "PartialEncoderImpute",
             "PartialEncoderWeightedSum",
+            "PartialEncoderWeightedSumEDDI",
             "PartialEncoderTransformer",
+            "PartialEncoderEDDI",
         ] = "PartialEncoder",
         junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
         pool_mode: Literal["mean","sum"] = "mean",
@@ -1088,6 +1310,8 @@ class PARTIALVAE(BaseModuleClass):
 
         # Instantiate encoder + decoder, passing covariate specs
 
+        print(f"Using code_dim={code_dim}!")
+
         # instantiate the requested encoder
         if encoder_type == "PartialEncoder":
             print(f"Using Regular Partial Encoder")
@@ -1103,6 +1327,21 @@ class PARTIALVAE(BaseModuleClass):
                 inject_covariates=encode_covariates,
                 pool_mode=pool_mode,
             )
+        elif encoder_type == "PartialEncoderEDDI":
+            print(f"Using EDDI Partial Encoder")
+            self.encoder = PartialEncoderEDDI(
+                input_dim=n_input,
+                code_dim=code_dim,
+                h_hidden_dim=h_hidden_dim,
+                encoder_hidden_dim=encoder_hidden_dim,
+                latent_dim=n_latent,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                pool_mode=pool_mode,
+            )
+
         elif encoder_type == "PartialEncoderImpute":
             print("Using Impute encoder")
             self.encoder = PartialEncoderImpute(
@@ -1131,6 +1370,23 @@ class PARTIALVAE(BaseModuleClass):
                 inject_covariates=encode_covariates,
                 junction_inclusion=junction_inclusion,
             )
+        
+        elif encoder_type == "PartialEncoderWeightedSumEDDI":
+            print("Using WeightedSum encoder EDDI version")
+
+            self.encoder = PartialEncoderWeightedSumEDDI(
+                input_dim=n_input,
+                code_dim=code_dim,
+                h_hidden_dim=h_hidden_dim,
+                encoder_hidden_dim=encoder_hidden_dim,
+                latent_dim=n_latent,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                junction_inclusion=junction_inclusion,
+            )
+
         elif encoder_type == "PartialEncoderTransformer":
             print("Using Transformer encoder")
             self.encoder = PartialEncoderTransformer(

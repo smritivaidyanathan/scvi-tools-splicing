@@ -73,7 +73,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     def __init__(
         self,
         adata: AnnData | None = None,
-        code_dim: int = 32,
+        code_dim: int = 16,
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
         latent_dim: int = 10,
@@ -88,7 +88,9 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             "PartialEncoder",
             "PartialEncoderImpute",
             "PartialEncoderWeightedSum",
+            "PartialEncoderWeightedSumEDDI",
             "PartialEncoderTransformer",
+            "PartialEncoderEDDI",
         ] = "PartialEncoder",
         junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
         pool_mode: Literal["mean","sum"]="mean",
