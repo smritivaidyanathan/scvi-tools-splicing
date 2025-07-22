@@ -91,6 +91,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             "PartialEncoderWeightedSumEDDI",
             "PartialEncoderTransformer",
             "PartialEncoderEDDI",
+            "PartialEncoderEDDIGNN",
         ] = "PartialEncoder",
         junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
         pool_mode: Literal["mean","sum"]="mean",
@@ -167,6 +168,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                     self.init_feature_embedding_from_adata()
                 if splice_likelihood == "dirichlet_multinomial":
                     self.init_junc2atse()
+                    if "gnn" in encoder_type.lower(): #NOTE: THE GNN WILL FOR NOW ONLY WORK IF DM LIKELIHOOD IS USED!!!
+                        self._setup_junction_gnn_edges()
                 self.module.num_junctions=len(self.adata.var)
 
         self.init_params_ = self._get_init_params(locals())
@@ -190,6 +193,47 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         atse_labels = self.adata.var["event_id"]
         j2a = self.make_junc2atse(atse_labels)
         self.module.junc2atse = j2a.coalesce().to(self.module.device)
+
+    def _setup_junction_gnn_edges(self) -> None:
+        """
+        Build a J×J junction–junction edge_index from
+        the module’s junc2atse sparse tensor and
+        attach it to the encoder as `edge_index`.
+        """
+        print("Setting up junction GNN edges...")
+        # coalesced sparse COO (J, G) J = num junctions, G = num ATSEs
+        j2a = self.module.junc2atse.coalesce()
+        J, G = j2a.shape
+        idx_j, idx_g = j2a.indices()  # each length ≈ J
+
+        # group junctions by ATSE
+        groups: dict[int, list[int]] = {}
+        for j, g in zip(idx_j.tolist(), idx_g.tolist()):
+            groups.setdefault(g, []).append(j)
+
+        # fully connect all junctions within each group
+        edge_list: list[list[int]] = []
+        for js in groups.values():
+            for i in js:
+                for j in js:
+                    if i != j:
+                        edge_list.append([i, j])
+
+        E = len(edge_list)
+        avg_deg = E / J
+        print(f"→ Total directed edges: {E}")
+        print(f"→ Number of junctions:   {J}")
+        print(f"→ Average edges per junction: {avg_deg:.2f}")
+
+        edge_index = (
+            torch.tensor(edge_list, dtype=torch.long)
+                 .t()
+                 .contiguous()
+                 .to(self.module.device)
+        )
+        self.module.encoder.edge_index = edge_index
+        print("Set up junction GNN edges!")
+
 
 
     def init_feature_embedding_from_adata(self) -> None:

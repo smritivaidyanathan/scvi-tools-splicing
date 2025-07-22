@@ -402,7 +402,7 @@ from torch import nn
 from collections.abc import Iterable
 from scvi.nn import FCLayers
 
-
+#proper EDDI partial encoder. only passes observed junctions and their embeddings into the h layer. 
 class PartialEncoderEDDI(nn.Module):
     def __init__(
         self,
@@ -476,10 +476,13 @@ class PartialEncoderEDDI(nn.Module):
             h_in = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)  # (n_obs, 1 + code_dim)
             h_out = self.h_layer(h_in)  # (n_obs, code_dim)
 
+            summed = h_out.sum(dim=0)
+
             if self.pool_mode == "mean":
-                c = h_out.mean(dim=0)  # (code_dim,)
+                num_obs = obs_idx.sum().clamp(min=1)
+                c = summed / num_obs
             else:
-                c = h_out.sum(dim=0)   # (code_dim,)
+                c = summed   # (code_dim,)
 
             outputs.append(c)
 
@@ -490,10 +493,163 @@ class PartialEncoderEDDI(nn.Module):
         return mu, logvar
 
 
+import torch
+from torch import nn
+from typing import Iterable, Literal
+from scvi.nn import FCLayers
+from torch_geometric.nn import GCNConv
+
+class PartialEncoderEDDIGNN(nn.Module):
+    """
+    GNN‑augmented EDDI Partial Encoder
+
+    Extends the PartialEncoderEDDI (EDDI framework) by refining per‑junction
+    embeddings via a small GCN over a junction–junction graph before
+    aggregation.
+
+    Parameters
+    ----------
+    input_dim : int
+        Number of junctions/features (J).
+    code_dim : int
+        Size of each per‑junction embedding (D).
+    h_hidden_dim : int
+        Hidden size in the EDDI h‑network.
+    encoder_hidden_dim : int
+        Hidden size of the final encoder MLP.
+    latent_dim : int
+        Dimension of the VAE latent space (Z).
+    dropout_rate : float
+        Dropout probability in the h‑network.
+    n_cat_list : Iterable[int] | None
+        Sizes of categorical covariates to inject.
+    n_cont : int
+        Number of continuous covariates to inject.
+    inject_covariates : bool
+        Whether to append covariates to the final MLP.
+    pool_mode : {"mean","sum"}
+        How to pool per‑junction codes into a single vector.
+    edge_index : torch.LongTensor | None
+        PyG edge index (2, E) defining junction–junction graph.
+    gnn_layers : int
+        Number of GCNConv layers to apply.
+    gnn_epochs : int
+        Number of training steps to update embeddings via GNN.
+
+    Attributes
+    ----------
+    feature_embedding : nn.Parameter
+        Tensor of shape (J, D), one vector per junction.
+    gnn_convs : ModuleList[GCNConv]
+        GCN layers for embedding refinement.
+    h_layer : nn.Sequential
+        EDDI h‑network mapping [psi, embedding] → code_dim.
+    encoder_mlp : FCLayers
+        MLP mapping pooled codes (+ covariates) → (2 * latent_dim).
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        pool_mode: Literal["mean", "sum"] = "mean",
+        *,
+        edge_index: torch.LongTensor | None = None,
+        gnn_layers: int = 2,
+        gnn_epochs: int = 10,
+    ):
+        super().__init__()
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        self.code_dim = code_dim
+        self.pool_mode = pool_mode
+
+        # GNN setup
+        self.edge_index = edge_index #(2, E)
+        # In the above, `E` denotes the total number of directed edges (i.e., connections) in the junction–junction graph.
+        # The `edge_index` tensor has shape (2, E), where each column [i, j] specifies a directed edge from junction i to junction j.
+
+        self.gnn_convs = nn.ModuleList([
+            GCNConv(code_dim, code_dim) for _ in range(gnn_layers)
+        ])
+        self.gnn_epochs = gnn_epochs
+        self._gnn_steps = 0
+
+        # Per‑junction embeddings
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+        # EDDI h‑network
+        in_dim = 1 + code_dim
+        self.h_layer = nn.Sequential(
+            nn.Linear(in_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(h_hidden_dim, code_dim),
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
+        )
+
+        # Final encoder MLP
+        self.encoder_mlp = FCLayers(
+            n_in=code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=n_cat_list or [],
+            n_cont=n_cont,
+            n_layers=2,
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,       # (B, J)
+        mask: torch.Tensor,    # (B, J)
+        *cat_list: torch.Tensor,
+        cont: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 1) GNN‑based refinement for first `gnn_epochs` steps
+        if self.training and self.edge_index is not None and self._gnn_steps < self.gnn_epochs:
+            F = self.feature_embedding  # (J, D)
+            for conv in self.gnn_convs:
+                F = torch.relu(conv(F, self.edge_index))
+            self.feature_embedding.data.copy_(F)
+            self._gnn_steps += 1
+
+        # 2) EDDI aggregation and MLP to μ, logvar
+        B, J = x.shape
+        codes = []
+        for b in range(B):
+            obs = mask[b].bool()
+            psi_vals = x[b, obs]                     # (n_obs,)
+            embeddings = self.feature_embedding[obs]  # (n_obs, D)
+            # pass [psi, embedding] through h_layer, then pool
+            h_out = self.h_layer(torch.cat([psi_vals.unsqueeze(-1), embeddings], dim=1))
+            summed = h_out.sum(dim=0)
+            if self.pool_mode == "mean":
+                count = obs.sum().clamp(min=1)
+                codes.append(summed / count)
+            else:
+                codes.append(summed)
+        c = torch.stack(codes, dim=0)  # (B, D)
+
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # (B, 2*latent_dim)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
 
 
-
-
+#Partial Encoder - slightly incorrect setup. this passes all junctions in the h layer instead of just the observed ones
 class PartialEncoder(nn.Module):
     def __init__(
         self,
@@ -597,8 +753,6 @@ class PartialEncoder(nn.Module):
         mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # -> (B, 2*latent_dim)
         mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
-
-
 
 
 class PartialEncoderWeightedSum(nn.Module):
@@ -1273,6 +1427,7 @@ class PARTIALVAE(BaseModuleClass):
             "PartialEncoderWeightedSumEDDI",
             "PartialEncoderTransformer",
             "PartialEncoderEDDI",
+            "PartialEncoderEDDIGNN",
         ] = "PartialEncoder",
         junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
         pool_mode: Literal["mean","sum"] = "mean",
@@ -1340,6 +1495,26 @@ class PARTIALVAE(BaseModuleClass):
                 n_cont=n_continuous_cov,
                 inject_covariates=encode_covariates,
                 pool_mode=pool_mode,
+            )
+
+        elif encoder_type == "PartialEncoderEDDIGNN":
+            print("Using EDDI + GNN Partial Encoder")
+            # assume you’ve already built `junc2atse_edge_index` from your sparse junc2atse:
+            #    junc2atse_edge_index = junc2atse._indices()
+            self.encoder = PartialEncoderEDDIGNN(
+                input_dim=n_input,
+                code_dim=code_dim,
+                h_hidden_dim=h_hidden_dim,
+                encoder_hidden_dim=encoder_hidden_dim,
+                latent_dim=n_latent,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                pool_mode=pool_mode,
+                # GNN‑specific args:
+                gnn_layers=2,
+                gnn_epochs=10,
             )
 
         elif encoder_type == "PartialEncoderImpute":
