@@ -622,6 +622,8 @@ class PartialEncoderEDDIGNN(nn.Module):
         # 1) GNN‑based refinement for first `gnn_epochs` steps
         if self.training and self.edge_index is not None and self._gnn_steps < self.gnn_epochs:
             F = self.feature_embedding  # (J, D)
+            if self.edge_index.device != F.device:
+                self.edge_index = self.edge_index.to(F.device)
             for conv in self.gnn_convs:
                 F = torch.relu(conv(F, self.edge_index))
             self.feature_embedding.data.copy_(F)
@@ -647,7 +649,6 @@ class PartialEncoderEDDIGNN(nn.Module):
         mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # (B, 2*latent_dim)
         mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
-
 
 #Partial Encoder - slightly incorrect setup. this passes all junctions in the h layer instead of just the observed ones
 class PartialEncoder(nn.Module):
