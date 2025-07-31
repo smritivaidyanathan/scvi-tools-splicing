@@ -91,6 +91,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             "PartialEncoderWeightedSumEDDI",
             "PartialEncoderTransformer",
             "PartialEncoderEDDI",
+            "PartialEncoderEDDIATSE",
             "PartialEncoderEDDIGNN",
         ] = "PartialEncoder",
         junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
@@ -170,7 +171,11 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                     self.init_junc2atse()
                     if "gnn" in encoder_type.lower(): #NOTE: THE GNN WILL FOR NOW ONLY WORK IF DM LIKELIHOOD IS USED!!!
                         self._setup_junction_gnn_edges()
+                    if "atse" in encoder_type.lower():
+                        print("Registering junc2ATSE")
+                        self.module.encoder.register_junc2atse(self.module.junc2atse)
                 self.module.num_junctions=len(self.adata.var)
+
 
         self.init_params_ = self._get_init_params(locals())
 
