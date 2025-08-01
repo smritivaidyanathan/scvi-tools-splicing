@@ -1737,6 +1737,7 @@ class PARTIALVAE(BaseModuleClass):
             "PartialEncoderTransformer",
             "PartialEncoderEDDI",
             "PartialEncoderEDDIATSE",
+            "PartialEncoderEDDIATSEL",
             "PartialEncoderEDDIGNN",
         ] = "PartialEncoder",
         junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
@@ -1809,6 +1810,21 @@ class PARTIALVAE(BaseModuleClass):
 
         elif encoder_type == "PartialEncoderEDDIATSE":
             print("Using EDDI + ATSE Partial Encoder")
+            self.encoder = PartialEncoderEDDIATSE(
+                input_dim=n_input,
+                code_dim=code_dim,
+                h_hidden_dim=h_hidden_dim,
+                encoder_hidden_dim=encoder_hidden_dim,
+                latent_dim=n_latent,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                pool_mode=pool_mode,
+            )
+        
+        elif encoder_type == "PartialEncoderEDDIATSEL":
+            print("Using EDDI + ATSE Partial Encoder with Latent ATSE Dim")
             self.encoder = PartialEncoderEDDIATSEL(
                 input_dim=n_input,
                 code_dim=code_dim,

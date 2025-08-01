@@ -92,6 +92,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             "PartialEncoderTransformer",
             "PartialEncoderEDDI",
             "PartialEncoderEDDIATSE",
+            "PartialEncoderEDDIATSEL",
             "PartialEncoderEDDIGNN",
         ] = "PartialEncoder",
         junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
