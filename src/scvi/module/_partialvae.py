@@ -1280,6 +1280,136 @@ class PartialEncoderWeightedSumEDDI(nn.Module):
         return mu, logvar
 
 
+class PartialEncoderWeightedSumEDDIMultiWeight(nn.Module):
+    """
+    EDDI-style encoder that for each junction produces W weightings (instead of a single scalar),
+    yielding W separate weighted sums of per-junction codes, and then learns to pool those W
+    intermediate vectors into a final code via a linear combiner.
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        num_weight_vectors: int = 4,  # W
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        junction_inclusion: str = "all_junctions",  # "all_junctions" or "observed_junctions"
+    ):
+        super().__init__()
+        assert junction_inclusion in ("all_junctions", "observed_junctions")
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        self.code_dim = code_dim
+        self.junction_inclusion = junction_inclusion
+        self.num_weight_vectors = num_weight_vectors
+
+        if self.junction_inclusion == "all_junctions":
+            print("Including all junctions into multi-weighted sum")
+        else:
+            print("Using only observed junctions for multi-weighted sum")
+
+        # per-junction embeddings
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+        # shared h-network: [psi, embedding] -> code_dim
+        in_dim = 1 + code_dim
+        self.h_layer = nn.Sequential(
+            nn.Linear(in_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(h_hidden_dim, code_dim),
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
+        )
+
+        # gate_net now outputs W scores per junction
+        self.gate_net = nn.Sequential(
+            nn.Linear(code_dim, code_dim // 2),
+            nn.ReLU(),
+            nn.Linear(code_dim // 2, num_weight_vectors),  # (n_obs, W)
+        )
+
+        # combiner: collapse W * code_dim -> code_dim
+        self.combiner = nn.Sequential(
+            nn.Linear(num_weight_vectors * code_dim, code_dim),
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
+        )
+
+        # final encoder MLP
+        self.encoder_mlp = FCLayers(
+            n_in=code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=n_cat_list or [],
+            n_cont=n_cont,
+            n_layers=2,
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,                # (B, D)
+        mask: torch.Tensor,             # (B, D)
+        *cat_list: torch.Tensor,        # each (B,1)
+        cont: torch.Tensor | None = None,  # (B, n_cont)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, D = x.shape
+        device = x.device
+        outputs = []
+
+        for b in range(B):
+            if self.junction_inclusion == "observed_junctions":
+                obs_idx = mask[b].bool()  # (D,)
+            else:
+                obs_idx = torch.ones(D, dtype=torch.bool, device=device)  # all junctions
+
+            if obs_idx.sum() == 0:
+                # fallback: no observed junctions
+                outputs.append(torch.zeros(self.code_dim, device=device))
+                continue
+
+            x_obs = x[b, obs_idx]                     # (n_obs,)
+            F_obs = self.feature_embedding[obs_idx]    # (n_obs, code_dim)
+
+            # per-junction code
+            h_in = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)  # (n_obs, 1 + code_dim)
+            h_out = self.h_layer(h_in)                            # (n_obs, code_dim)
+
+            # produce W raw gate scores per junction: (n_obs, W)
+            raw_gates = self.gate_net(h_out)  # (n_obs, W)
+
+            # normalize over junctions for each of the W weight vectors
+            weights = torch.softmax(raw_gates, dim=0)  # (n_obs, W); softmax over junctions
+
+            # compute W aggregated vectors: (W, code_dim)
+            # weights.T: (W, n_obs) -> unsqueeze(-1): (W, n_obs, 1)
+            # h_out: (n_obs, code_dim) -> unsqueeze(0): (1, n_obs, code_dim)
+            head_sums = (weights.T.unsqueeze(-1) * h_out.unsqueeze(0)).sum(dim=1)  # (W, code_dim)
+
+            # flatten and combine: (W * code_dim,) -> code_dim
+            combined = self.combiner(head_sums.reshape(-1))  # (code_dim,)
+
+            outputs.append(combined)
+
+        c = torch.stack(outputs, dim=0)  # (B, code_dim)
+
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # (B, 2*latent_dim)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
+
+
+
 class PartialEncoderImpute(nn.Module):
     def __init__(
         self,
