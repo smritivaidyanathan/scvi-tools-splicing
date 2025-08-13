@@ -39,6 +39,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 import pandas as pd 
 
+from sklearn.decomposition import TruncatedSVD
+import scipy.sparse as sp
+
 
 class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     """
@@ -85,18 +88,13 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         initialize_embeddings_from_pca: bool = True,
         num_transformer_layers: int = 2,
         encoder_type: Literal[
-            "PartialEncoder",
-            "PartialEncoderImpute",
-            "PartialEncoderWeightedSum",
-            "PartialEncoderWeightedSumEDDI",
-            "PartialEncoderTransformer",
+            "PartialEncoderWeightedSumEDDIMultiWeight",
+            "PartialEncoderWeightedSumEDDIMultiWeightATSE",
             "PartialEncoderEDDI",
             "PartialEncoderEDDIATSE",
-            "PartialEncoderEDDIATSEL",
-            "PartialEncoderEDDIGNN",
-        ] = "PartialEncoder",
-        junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
+        ] = "PartialEncoderEDDI",
         pool_mode: Literal["mean","sum"]="mean",
+        num_weight_vectors: int = 4,
         **kwargs,
     ):
         super().__init__(adata)
@@ -115,8 +113,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             deeply_inject_covariates=deeply_inject_covariates,
             num_transformer_layers=num_transformer_layers,
             encoder_type = encoder_type,
-            junction_inclusion = junction_inclusion,
             pool_mode=pool_mode,
+            num_weight_vectors = num_weight_vectors,
             **kwargs,
         )
 
@@ -131,7 +129,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             f"encode_covariates={encode_covariates}, "
             f"deeply_inject_covariates={deeply_inject_covariates}, "
             f"initialize_embeddings_from_pca={initialize_embeddings_from_pca}, "
-            f"encoder_type={encoder_type}, junction_inclusion={junction_inclusion}, pool_mode={pool_mode}."
+            f"encoder_type={encoder_type}, num_weight_vectors={num_weight_vectors}, pool_mode={pool_mode}."
         )
 
 
@@ -175,11 +173,28 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                     if "atse" in encoder_type.lower():
                         print("Registering junc2ATSE")
                         self.module.encoder.register_junc2atse(self.module.junc2atse)
+                    if "multi" in encoder_type.lower():
+                        if self.module.encoder.temperature_fixed < 0.0:
+                            self.set_median_obs_temperature()
+                            
                 self.module.num_junctions=len(self.adata.var)
 
 
         self.init_params_ = self._get_init_params(locals())
 
+
+    def set_median_obs_temperature(self):
+        mask = self.adata.layers["psi_mask"]
+        if sp.issparse(mask):
+            # Sum over columns per row; yields a (B, 1) matrix
+            counts = np.asarray(mask.sum(axis=1)).ravel()
+            median_obs = np.median(counts)
+        else:
+            mask = self.adata.layers["psi_mask"]           # shape (B, J), 0/1 or bool
+            median_obs = np.median((mask > 0).sum(axis=1)) # per-cell count → median
+        print(f"Resetting temperature_fixed to be 1/sqrt of number of observed junctions. median(n_obs) = {median_obs}")
+        self.module.encoder.temperature_fixed =  1.0 / max(np.sqrt(median_obs), 1.0)
+        
     def make_junc2atse(self, atse_labels):
         print("Making Junc2Atse...")
         num_junctions = len(atse_labels)
@@ -240,40 +255,27 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         self.module.encoder.edge_index = edge_index
         print("Set up junction GNN edges!")
 
-
-
     def init_feature_embedding_from_adata(self) -> None:
-        """
-        Center the `junc_ratio` layer, run PCA on it, and copy
-        the resulting components into the encoder.feature_embedding.
-        """
-
-        from sklearn.decomposition import PCA
-        import scipy.sparse as sp
-        print("Initializing Feature Embeddings from Adata...")
-    
-        # 1) figure out which layer was registered as X_KEY
         layer = self.adata_manager.data_registry[REGISTRY_KEYS.X_KEY].attr_key
         X = self.adata.layers[layer]
-        # 2) densify and cast
-        if sp.issparse(X):
-            X = X.toarray()
-        X = np.asarray(X, dtype=float)
-        # 3) column‐wise centering
-        col_means = np.nanmean(X, axis=0)
-        X_centered = X - col_means[None, :]
-        X_centered[np.isnan(X_centered)] = 0.0
-        # 4) PCA
-        pca = PCA(n_components=self.module.encoder.code_dim)
-        pca.fit(X_centered)
-        comps = pca.components_.T  # (n_vars, code_dim)
-        # 5) copy into the encoder
+        # keep X sparse:
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+
+        # fit a (code_dim)-component SVD on the sparse X
+        svd = TruncatedSVD(n_components=self.module.encoder.code_dim,
+                        algorithm="randomized")
+        svd.fit(X)
+
+        # components_.shape == (n_components, n_vars)
+        comps = svd.components_.T  # (n_vars, code_dim)
+
         with torch.no_grad():
             self.module.encoder.feature_embedding.copy_(
                 torch.as_tensor(comps, dtype=self.module.encoder.feature_embedding.dtype)
             )
-        print("Initialized Feature Embeddings.")
-    
+
+        
     @devices_dsp.dedent
     def train(
         self,

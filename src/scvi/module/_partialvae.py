@@ -243,162 +243,6 @@ def beta_binomial_loss_function(
     log_lik = log_lik #* (float(n) / float(k))
     return -log_lik.mean()
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import Tensor
-from typing import Optional
-
-class LinformerSelfAttention(nn.Module):
-    """
-    A lean version of self-attention: we squish the keys and values
-    down to a smaller dimension k before doing dot-product attention.
-    This is the core trick from the Linformer paper (Wang et al. 2020):
-    "We show that self-attention can be projected onto a low-rank
-    subspace, reducing the complexity from O(n^2) to O(nk)."
-    Eq. (5) in the paper: Approx softmax(Q K^T / sqrt(d)) V
-    but with K, V replaced by E X and F X.
-    """
-    def __init__(self, embed_dim: int, num_heads: int, k: int, max_seq_len: int):
-        super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        # scaling factor 1/sqrt(d)
-        self.scale = self.head_dim ** -0.5
-
-        # standard linear projections for Q, K, V
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.v_proj = nn.Linear(embed_dim, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-
-        # These are the low-rank projection matrices (E for keys, F for values).
-        # We learn E, F of shape (k, embed_dim), so seq_len D -> k.
-        self.E_proj = nn.Linear(max_seq_len, k, bias=False)
-        self.F_proj = nn.Linear(max_seq_len, k, bias=False)
-        self.max_seq_len = max_seq_len
-
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
-        """
-        x: (B, D, C) where D = sequence length, C = embed_dim
-        mask: (B, D) with True for positions to keep
-        """
-        B, D, C = x.shape
-
-        if D != self.max_seq_len:
-            raise RuntimeError(f"Expected sequence length {self.max_seq_len}, got {D}")
-
-        # 1) project inputs to queries, keys, values
-        q = self.q_proj(x)  # (B, D, C)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        # 2) split into heads: shape (B, h, D, head_dim)
-        def split_heads(t):
-            return t.view(B, D, self.num_heads, self.head_dim)\
-                    .transpose(1, 2)
-        q, k, v = map(split_heads, (q, k, v))
-
-        # 3) Linformer trick: project seq_len D down to k for k & v
-        #    flatten batch & heads -> (B*h, D, head_dim)
-        Bh = B * self.num_heads
-        k = k.reshape(Bh, D, self.head_dim)
-        v = v.reshape(Bh, D, self.head_dim)
-        # project seq-axis D→k via E_proj, F_proj
-        # k,v are (B*h, D, head_dim) → transpose to (B*h, head_dim, D)
-        k = self.E_proj(k.transpose(1,2)).transpose(1,2)  # → (B*h, k, head_dim)
-        v = self.F_proj(v.transpose(1,2)).transpose(1,2)
-
-        # 4) reshape q similarly for matmul: (B*h, D, head_dim)
-        q = q.reshape(Bh, D, self.head_dim)
-
-        # 5) compute scaled dot-product attention
-        #    eq: A = softmax( Q K^T / sqrt(d) )
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (Bh, D, k)
-        if mask is not None:
-            # mask: True means keep, False means pad
-            # expand mask to (Bh, D, k)
-            m = mask.unsqueeze(1).repeat(1, self.num_heads, 1)  # (B, h, D)
-            m = m.reshape(Bh, D).unsqueeze(-1).expand(-1, -1, k.size(1))
-            attn_scores = attn_scores.masked_fill(~m, float('-inf'))
-        attn = F.softmax(attn_scores, dim=-1)
-        # replace any NaNs (from all-masked rows) with zeros
-        attn = torch.nan_to_num(attn, nan=0.0)
-
-        # 6) weighted sum: (Bh, D, k) x (Bh, k, head_dim) -> (Bh, D, head_dim)
-        out = torch.matmul(attn, v)
-        # 7) reassemble heads -> (B, D, C)
-        out = out.view(B, self.num_heads, D, self.head_dim)\
-                  .transpose(1, 2)\
-                  .reshape(B, D, C)
-
-        # 8) final linear layer
-        return self.out_proj(out)
-
-
-class LinformerEncoderLayer(nn.Module):
-    """
-    A single transformer encoder block using LinformerSelfAttention.
-    Pretty much just like nn.TransformerEncoderLayer, but with our lean attention.
-    """
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        k: int,
-        dim_feedforward: int,
-        max_seq_len: int,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        # our custom self-attention
-        self.self_attn = LinformerSelfAttention(embed_dim, num_heads, k, max_seq_len)
-        # a small feed-forward network
-        self.linear1 = nn.Linear(embed_dim, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, embed_dim)
-
-        # layer norms & dropouts as usual
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-        # use ReLU like the original
-        self.activation = F.relu
-
-    def forward(self, src: Tensor, src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
-        """
-        src: (B, D, C)
-        src_key_padding_mask: (B, D), True=keep, False=pad
-        """
-        x = src
-        # 1) self-attention + add & norm
-        attn_out = self.self_attn(
-            x,
-            mask=(~src_key_padding_mask) if src_key_padding_mask is not None else None
-        )
-        x = x + self.dropout1(attn_out)
-        x = self.norm1(x)
-
-        # 2) feed-forward + add & norm
-        ff = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = x + self.dropout2(ff)
-        x = self.norm2(x)
-        return x
-
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Iterable
-
-
-
-
 
 import torch
 from torch import nn
@@ -631,665 +475,23 @@ class PartialEncoderEDDIATSE(nn.Module):
         return mu, logvar
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from typing import Iterable, Literal
 from scvi.nn import FCLayers
 
-class PartialEncoderEDDIATSEL(nn.Module):
+
+class PartialEncoderWeightedSumEDDIMultiWeightATSE(nn.Module):
     """
-    EDDI Partial Encoder extended to ATSE-level processing without Python loops
-    and mapping each ATSE to an L‑dim vector rather than a scalar.
-    """
-    def __init__(
-        self,
-        input_dim: int,        # J
-        code_dim: int,         # D
-        h_hidden_dim: int,
-        encoder_hidden_dim: int,
-        latent_dim: int,       # Z
-        atse_latent_dim: int = 16,  # L
-        dropout_rate: float = 0.0,
-        n_cat_list: Iterable[int] | None = None,
-        n_cont: int = 0,
-        inject_covariates: bool = True,
-        pool_mode: Literal["mean","sum"] = "mean",
-    ):
-        super().__init__()
-        self.pool_mode = pool_mode
-        self.atse_latent_dim = atse_latent_dim  # L
-        # PCA → junction embeddings (J×D), filled externally
-        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
-        # h-layer now sees (L + D) per ATSE
-        self.h_layer = nn.Sequential(
-            nn.Linear(atse_latent_dim + code_dim, h_hidden_dim),
-            nn.LayerNorm(h_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(h_hidden_dim, code_dim),
-            nn.LayerNorm(code_dim),
-            nn.ReLU(),
-        )
-        self.encoder_mlp = FCLayers(
-            n_in=code_dim,
-            n_out=2 * latent_dim,
-            n_cat_list=n_cat_list or [],
-            n_cont=n_cont,
-            n_layers=2,
-            n_hidden=encoder_hidden_dim,
-            dropout_rate=dropout_rate,
-            use_batch_norm=False,
-            use_layer_norm=True,
-            inject_covariates=inject_covariates,
-        )
+    EDDI-style encoder with multi-head weighted sum, augmented with ATSE one-hot features in the gate network.
 
-        self.code_dim = code_dim
-
-        # placeholders
-        self.register_buffer("junc2atse", torch.sparse_coo_tensor(size=(input_dim, 0)))
-        self.lin_layer = None  # will be a stack of L sparse maps (L×A×J)
-        self.n_atse = 0
-
-    @torch.no_grad()
-    def register_junc2atse(self, junc2atse: torch.sparse.Tensor):
-        """
-        Build:
-        - self.junc2atse  (J×A)
-        - self.j2a_t      (A×J)  # <-- Pre-compute this!
-        - self.lin_layer  (L×A×J sparse) mapping J→(L,A)
-        - overwrite feature_embedding ← ATSE embeddings (A×D)
-        """
-        # 1) move and store the raw mapping
-        j2a = junc2atse.coalesce().to(self.feature_embedding.device)
-        self.register_buffer("junc2atse", j2a)
-        # also keep a transposed copy for pooling - PRE-COMPUTE THIS
-        self.register_buffer("j2a_t", j2a.transpose(0, 1).coalesce())
-
-        # infer sizes
-        J, _ = j2a.shape
-        _, atse_idx = j2a.indices()
-        A = int(atse_idx.max().item()) + 1
-        L = self.atse_latent_dim
-        self.n_atse = A
-
-        # 2) compute mean‐PCA → ATSE embeddings (A×D)
-        counts = torch.sparse.mm(self.j2a_t, torch.ones(J, 1, device=j2a.device))  # (A×1)
-        atse_feat = torch.sparse.mm(self.j2a_t, self.feature_embedding) / counts    # (A×D)
-        # freeze these as non‐learnable embeddings
-        self.feature_embedding = nn.Parameter(atse_feat, requires_grad=False)
-
-        # 3) build sparse stack of L independent maps: shape (L, A, J)
-        #    each latent channel ℓ uses the same J→A pattern but its own weights
-        p_idx, a_idx = j2a.indices()         # p_idx: junction index, a_idx: ATSE index
-        nnz = p_idx.numel()
-
-        # repeat for each ℓ in 0..L-1
-        l_idx      = torch.arange(L, device=j2a.device).repeat_interleave(nnz)
-        a_idx_rep  = a_idx.repeat(L)
-        p_idx_rep  = p_idx.repeat(L)
-
-        indices = torch.stack([l_idx, a_idx_rep, p_idx_rep], dim=0)  # (3, nnz*L)
-        values  = torch.randn(nnz * L, device=j2a.device)         # one weight per entry
-
-        device = self.feature_embedding.device
-        lin_layer = torch.sparse_coo_tensor(
-            indices,
-            values,
-            size=(L, A, J),
-            device=device,
-        )
-        self.lin_layer = lin_layer
-
-    def forward(
-        self,
-        x: torch.Tensor,       # (B, J)
-        mask: torch.Tensor,    # (B, J)
-        *cat_list, cont=None
-    ):
-        device = x.device
-        if self.lin_layer.device != device:
-            # move it once (or every forward) so bmm won't error
-            self.lin_layer = self.lin_layer.to(device)
-
-        B, J = x.shape
-        L, A, _ = self.lin_layer.shape
-
-        # now you know self.lin_layer and x are co‑located
-        xt = x.T.unsqueeze(0).expand(L, -1, -1)   # (L, J, B)
-        out = torch.bmm(self.lin_layer, xt)       # (L, A, B)
-        A_embed = out.permute(2, 1, 0)            # (B, A, L)
-
-        # 2) build feature embeddings per ATSE: (A,D) → expand (B,A,D)
-        F = self.feature_embedding.unsqueeze(0).expand(B, -1, -1)
-
-        # 3) mask out unobserved ATSEs (B,A) → expand to (B,A,L+D)
-        # Alternative: use pre-computed transpose
-        obs = torch.sparse.mm(self.j2a_t, mask.float().t()).t().bool()  # (B,A)
-        
-        # OR if you don't want to pre-compute transpose, use this alternative:
-        # obs = torch.sparse.mm(mask.float(), self.junc2atse).bool()  # (B,A)
-        A_embed[~obs] = 0
-        F[~obs] = 0
-
-        # 4) concatenate & run through h-layer in one shot
-        h_in = torch.cat([A_embed, F], dim=-1)         # (B,A,L+D)
-        # flatten batch/ATSE dim
-        h_flat = h_in.reshape(B*A, L + self.code_dim)  
-        h_out  = self.h_layer(h_flat)                  # (B*A, D)
-        h_out  = h_out.reshape(B, A, self.code_dim)    # (B,A,D)
-
-        # 5) pool - FIXED VERSION to avoid division by zero
-        if self.pool_mode == "mean":
-            # Count observed ATSEs per batch sample
-            obs_counts = obs.sum(1, keepdim=True).float()  # (B, 1)
-            
-            # Clamp to minimum of 1 to avoid division by zero
-            obs_counts = torch.clamp(obs_counts, min=1.0)
-            
-            # Mean pooling with safe division
-            c = h_out.sum(1) / obs_counts  # (B, D)
-            
-            # Alternative: you could also handle the zero case explicitly
-            # obs_counts = obs.sum(1, keepdim=True).float()  # (B, 1)
-            # summed = h_out.sum(1)  # (B, D)
-            # c = torch.where(obs_counts > 0, summed / obs_counts, summed)
-        else:
-            c = h_out.sum(1)# (B, D)
-
-        # 6) final MLP
-        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
-        mu, logvar = mu_logvar.chunk(2, dim=-1)
-        return mu, logvar
-
-
-import torch
-from torch import nn
-from typing import Iterable, Literal
-from scvi.nn import FCLayers
-from torch_geometric.nn import GCNConv
-
-class PartialEncoderEDDIGNN(nn.Module):
-    """
-    GNN‑augmented EDDI Partial Encoder
-
-    Extends the PartialEncoderEDDI (EDDI framework) by refining per‑junction
-    embeddings via a small GCN over a junction–junction graph before
-    aggregation.
-
-    Parameters
-    ----------
-    input_dim : int
-        Number of junctions/features (J).
-    code_dim : int
-        Size of each per‑junction embedding (D).
-    h_hidden_dim : int
-        Hidden size in the EDDI h‑network.
-    encoder_hidden_dim : int
-        Hidden size of the final encoder MLP.
-    latent_dim : int
-        Dimension of the VAE latent space (Z).
-    dropout_rate : float
-        Dropout probability in the h‑network.
-    n_cat_list : Iterable[int] | None
-        Sizes of categorical covariates to inject.
-    n_cont : int
-        Number of continuous covariates to inject.
-    inject_covariates : bool
-        Whether to append covariates to the final MLP.
-    pool_mode : {"mean","sum"}
-        How to pool per‑junction codes into a single vector.
-    edge_index : torch.LongTensor | None
-        PyG edge index (2, E) defining junction–junction graph.
-    gnn_layers : int
-        Number of GCNConv layers to apply.
-    gnn_epochs : int
-        Number of training steps to update embeddings via GNN.
-
-    Attributes
-    ----------
-    feature_embedding : nn.Parameter
-        Tensor of shape (J, D), one vector per junction.
-    gnn_convs : ModuleList[GCNConv]
-        GCN layers for embedding refinement.
-    h_layer : nn.Sequential
-        EDDI h‑network mapping [psi, embedding] → code_dim.
-    encoder_mlp : FCLayers
-        MLP mapping pooled codes (+ covariates) → (2 * latent_dim).
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        code_dim: int,
-        h_hidden_dim: int,
-        encoder_hidden_dim: int,
-        latent_dim: int,
-        dropout_rate: float = 0.0,
-        n_cat_list: Iterable[int] | None = None,
-        n_cont: int = 0,
-        inject_covariates: bool = True,
-        pool_mode: Literal["mean", "sum"] = "mean",
-        *,
-        edge_index: torch.LongTensor | None = None,
-        gnn_layers: int = 2,
-        gnn_epochs: int = 10,
-    ):
-        super().__init__()
-        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
-        self.n_cont = n_cont
-        self.inject_covariates = inject_covariates
-        self.code_dim = code_dim
-        self.pool_mode = pool_mode
-
-        # GNN setup
-        self.edge_index = edge_index #(2, E)
-        # In the above, `E` denotes the total number of directed edges (i.e., connections) in the junction–junction graph.
-        # The `edge_index` tensor has shape (2, E), where each column [i, j] specifies a directed edge from junction i to junction j.
-
-        self.gnn_convs = nn.ModuleList([
-            GCNConv(code_dim, code_dim) for _ in range(gnn_layers)
-        ])
-        self.gnn_epochs = gnn_epochs
-        self._gnn_steps = 0
-
-        # Per‑junction embeddings
-        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
-
-        # EDDI h‑network
-        in_dim = 1 + code_dim
-        self.h_layer = nn.Sequential(
-            nn.Linear(in_dim, h_hidden_dim),
-            nn.LayerNorm(h_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(h_hidden_dim, code_dim),
-            nn.LayerNorm(code_dim),
-            nn.ReLU(),
-        )
-
-        # Final encoder MLP
-        self.encoder_mlp = FCLayers(
-            n_in=code_dim,
-            n_out=2 * latent_dim,
-            n_cat_list=n_cat_list or [],
-            n_cont=n_cont,
-            n_layers=2,
-            n_hidden=encoder_hidden_dim,
-            dropout_rate=dropout_rate,
-            use_batch_norm=False,
-            use_layer_norm=True,
-            inject_covariates=inject_covariates,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,       # (B, J)
-        mask: torch.Tensor,    # (B, J)
-        *cat_list: torch.Tensor,
-        cont: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 1) GNN‑based refinement for first `gnn_epochs` steps
-        if self.training and self.edge_index is not None and self._gnn_steps < self.gnn_epochs:
-            F = self.feature_embedding  # (J, D)
-            if self.edge_index.device != F.device:
-                self.edge_index = self.edge_index.to(F.device)
-            for conv in self.gnn_convs:
-                F = torch.relu(conv(F, self.edge_index))
-            self.feature_embedding.data.copy_(F)
-            self._gnn_steps += 1
-
-        # 2) EDDI aggregation and MLP to μ, logvar
-        B, J = x.shape
-        codes = []
-        for b in range(B):
-            obs = mask[b].bool()
-            psi_vals = x[b, obs]                     # (n_obs,)
-            embeddings = self.feature_embedding[obs]  # (n_obs, D)
-            # pass [psi, embedding] through h_layer, then pool
-            h_out = self.h_layer(torch.cat([psi_vals.unsqueeze(-1), embeddings], dim=1))
-            summed = h_out.sum(dim=0)
-            if self.pool_mode == "mean":
-                count = obs.sum().clamp(min=1)
-                codes.append(summed / count)
-            else:
-                codes.append(summed)
-        c = torch.stack(codes, dim=0)  # (B, D)
-
-        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # (B, 2*latent_dim)
-        mu, logvar = mu_logvar.chunk(2, dim=-1)
-        return mu, logvar
-
-#Partial Encoder - slightly incorrect setup. this passes all junctions in the h layer instead of just the observed ones
-class PartialEncoder(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        code_dim: int,
-        h_hidden_dim: int,
-        encoder_hidden_dim: int,
-        latent_dim: int,
-        dropout_rate: float = 0.0,
-        n_cat_list: Iterable[int] | None = None,
-        n_cont: int = 0,
-        inject_covariates: bool = True,
-        pool_mode: Literal["mean","sum"] = "mean",
-    ):
-        super().__init__()
-        # keep track of how many one-hot cats and cont features
-        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
-        self.n_cont = n_cont
-        self.inject_covariates = inject_covariates
-        total_cov = sum(self.n_cat_list) + self.n_cont
-        self.code_dim = code_dim
-        self.pool_mode = pool_mode
-
-        print(f"pool_mode: {pool_mode}")
-
-        # per-feature embeddings
-        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
-
-        # shared h-network only sees [x_d, F_d]
-        in_dim = 1 + code_dim
-        self.h_layer = nn.Sequential(
-            nn.Linear(in_dim, h_hidden_dim),
-            nn.LayerNorm(h_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(h_hidden_dim, code_dim),
-            nn.LayerNorm(code_dim),
-            nn.ReLU(),
-        )
-
-        # ——— replace manual MLP with FCLayers ———
-        # note: n_in = code_dim; FCLayers will handle covariates internally
-        self.encoder_mlp = FCLayers(
-            n_in=code_dim,
-            n_out=2 * latent_dim,
-            n_cat_list=n_cat_list or [],
-            n_cont=n_cont,
-            n_layers=2,                    # [code_dim] -> [encoder_hidden_dim] -> [2*latent_dim]
-            n_hidden=encoder_hidden_dim,
-            dropout_rate=dropout_rate,
-            use_batch_norm=False,          # your original used LayerNorm not BatchNorm
-            use_layer_norm=True,
-            inject_covariates=inject_covariates,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,                # (B, D)
-        mask: torch.Tensor,             # (B, D)
-        *cat_list: torch.Tensor,        # each (B,1)
-        cont: torch.Tensor | None = None,  # (B, n_cont)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, D = x.shape
-
-        # --- step 1: flatten features for per-feature h_layer ---
-        x_flat = x.reshape(-1, 1)  # (B*D,1)
-        F_embed = (
-            self.feature_embedding
-                .unsqueeze(0)       # (1,D,code_dim)
-                .expand(B, D, -1)    # (B,D,code_dim)
-                .reshape(-1, self.feature_embedding.size(1))  # (B*D,code_dim)
-        )
-
-        # --- step 2: shared h_layer on [x_flat, F_embed] only ---
-        h_in = torch.cat([x_flat, F_embed], dim=1)  # (B*D, 1+code_dim)
-        h_out = self.h_layer(h_in).view(B, D, -1)    # (B, D, code_dim)
-
-        # --- step 3: transformer‐based aggregation ---
-        # build padding mask: True=positions to ignore
-        # nn.TransformerEncoderLayer with batch_first=True wants a (B, D, C) input
-        # and src_key_padding_mask of shape (B, D) with True where we want to mask
-        padding_mask = (mask == 0)
-
-        # apply the transformer layer
-        # output shape is (B, D, code_dim)
-
-        tr_out = h_out
-
-        # now pool across the D dimension
-        mask_exp = mask.unsqueeze(-1).float()  # (B, D, 1)
-        summed = (tr_out * mask_exp).sum(dim=1)
-        if self.pool_mode == "mean":
-            # divide by # observed junctions
-            counts = mask_exp.sum(dim=1).clamp(min=1e-8)
-            c = summed / counts
-        else:
-            # just sum
-            c = summed
-
-        # --- step 4: now pass the output into our mlp (FC layers handles cont and cat covariates automatically) ---
-        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # -> (B, 2*latent_dim)
-        mu, logvar = mu_logvar.chunk(2, dim=-1)
-        return mu, logvar
-
-
-class PartialEncoderWeightedSum(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        code_dim: int,
-        h_hidden_dim: int,
-        encoder_hidden_dim: int,
-        latent_dim: int,
-        dropout_rate: float = 0.0,
-        n_cat_list: Iterable[int] | None = None,
-        n_cont: int = 0,
-        inject_covariates: bool = True,
-        junction_inclusion: str = "all_junctions",
-    ):
-        super().__init__()
-        # keep track of how many one-hot cats and cont features
-        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
-        self.n_cont = n_cont
-        self.inject_covariates = inject_covariates
-        total_cov = sum(self.n_cat_list) + self.n_cont
-        self.code_dim = code_dim
-        self.junction_inclusion = junction_inclusion
-        if self.junction_inclusion == "all_junctions":
-            print("Including all junctions into weighted sum")
-        elif self.junction_inclusion == "observed_junctions":
-            print("Only Including observed junctions into weighted sum")
-
-        # per-feature embeddings
-        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
-
-        # shared h-network only sees [x_d, F_d]
-        in_dim = 1 + code_dim
-        self.h_layer = nn.Sequential(
-            nn.Linear(in_dim, h_hidden_dim),
-            nn.LayerNorm(h_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(h_hidden_dim, code_dim),
-            nn.LayerNorm(code_dim),
-            nn.ReLU(),
-        )
-
-        self.gate_net = nn.Sequential(
-            nn.Linear(code_dim, code_dim // 2),
-            nn.ReLU(),
-            nn.Linear(code_dim // 2, 1),
-        )
-
-        # ——— replace manual MLP with FCLayers ———
-        # note: n_in = code_dim; FCLayers will handle covariates internally
-        self.encoder_mlp = FCLayers(
-            n_in=code_dim,
-            n_out=2 * latent_dim,
-            n_cat_list=n_cat_list or [],
-            n_cont=n_cont,
-            n_layers=2,                    # [code_dim] -> [encoder_hidden_dim] -> [2*latent_dim]
-            n_hidden=encoder_hidden_dim,
-            dropout_rate=dropout_rate,
-            use_batch_norm=False,          # your original used LayerNorm not BatchNorm
-            use_layer_norm=True,
-            inject_covariates=inject_covariates,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,                # (B, D)
-        mask: torch.Tensor,             # (B, D)
-        *cat_list: torch.Tensor,        # each (B,1)
-        cont: torch.Tensor | None = None,  # (B, n_cont)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, D = x.shape
-
-        # --- step 1: flatten features for per-feature h_layer ---
-        x_flat = x.reshape(-1, 1)  # (B*D,1)
-        F_embed = (
-            self.feature_embedding
-                .unsqueeze(0)       # (1,D,code_dim)
-                .expand(B, D, -1)    # (B,D,code_dim)
-                .reshape(-1, self.feature_embedding.size(1))  # (B*D,code_dim)
-        )
-
-        # --- step 2: shared h_layer on [x_flat, F_embed] only ---
-        h_in = torch.cat([x_flat, F_embed], dim=1)  # (B*D, 1+code_dim)
-        h_out = self.h_layer(h_in).view(B, D, -1)    # (B, D, code_dim)
-
-        # ─── step 3: compute per-junction gate scores ───────────────────
-        # raw_gates: (B, D, 1)
-        raw_gates = self.gate_net(h_out)  
-
-        if self.junction_inclusion == "observed_junctions":
-            #mask out missing junctions so they get zero weight
-            raw_gates = raw_gates.masked_fill((mask == 0).unsqueeze(-1), float('-1e9'))
-
-        # normalize to [0,1] sum to 1 across D
-        weights = torch.softmax(raw_gates.squeeze(-1), dim=1)  # (B, D)
-
-        # ─── step 4: weighted sum instead of mean ──────────────────────
-        # bring weights to (B, D, 1) to match h_out
-        w_exp = weights.unsqueeze(-1)  
-        # c = Σ_j w_{b,j} * h_out[b,j,:]
-        c = (h_out * w_exp).sum(dim=1)  
-
-        # ─── step 5: your encoder MLP as before ────────────────────────
-        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
-        mu, logvar = mu_logvar.chunk(2, dim=-1)
-        return mu, logvar
-
-
-
-class PartialEncoderWeightedSumEDDI(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        code_dim: int,
-        h_hidden_dim: int,
-        encoder_hidden_dim: int,
-        latent_dim: int,
-        dropout_rate: float = 0.0,
-        n_cat_list: Iterable[int] | None = None,
-        n_cont: int = 0,
-        inject_covariates: bool = True,
-        junction_inclusion: str = "all_junctions",
-    ):
-        super().__init__()
-        # keep track of how many one-hot cats and cont features
-        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
-        self.n_cont = n_cont
-        self.inject_covariates = inject_covariates
-        total_cov = sum(self.n_cat_list) + self.n_cont
-        self.code_dim = code_dim
-        self.junction_inclusion = junction_inclusion
-        if self.junction_inclusion == "all_junctions":
-            print("Including all junctions into weighted sum")
-        elif self.junction_inclusion == "observed_junctions":
-            print("Only Including observed junctions into weighted sum")
-
-        # per-feature embeddings
-        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
-
-        # shared h-network only sees [x_d, F_d]
-        in_dim = 1 + code_dim
-        self.h_layer = nn.Sequential(
-            nn.Linear(in_dim, h_hidden_dim),
-            nn.LayerNorm(h_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(h_hidden_dim, code_dim),
-            nn.LayerNorm(code_dim),
-            nn.ReLU(),
-        )
-
-        self.gate_net = nn.Sequential(
-            nn.Linear(code_dim, code_dim // 2),
-            nn.ReLU(),
-            nn.Linear(code_dim // 2, 1),
-        )
-
-        # ——— replace manual MLP with FCLayers ———
-        # note: n_in = code_dim; FCLayers will handle covariates internally
-        self.encoder_mlp = FCLayers(
-            n_in=code_dim,
-            n_out=2 * latent_dim,
-            n_cat_list=n_cat_list or [],
-            n_cont=n_cont,
-            n_layers=2,                    # [code_dim] -> [encoder_hidden_dim] -> [2*latent_dim]
-            n_hidden=encoder_hidden_dim,
-            dropout_rate=dropout_rate,
-            use_batch_norm=False,          # your original used LayerNorm not BatchNorm
-            use_layer_norm=True,
-            inject_covariates=inject_covariates,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,                # (B, D)
-        mask: torch.Tensor,             # (B, D)
-        *cat_list: torch.Tensor,        # each (B,1)
-        cont: torch.Tensor | None = None,  # (B, n_cont)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, D = x.shape
-        device = x.device
-        code_dim = self.code_dim
-
-        # Prepare output tensor with zeros for missing junctions
-        h_out_full = torch.zeros((B, D, code_dim), device=device)
-
-        for b in range(B):
-            obs_idx = mask[b].bool()  # (D,)
-            x_obs = x[b, obs_idx]     # (n_obs,)
-            F_obs = self.feature_embedding[obs_idx]  # (n_obs, code_dim)
-
-            h_in = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)  # (n_obs, 1 + code_dim)
-            h_out = self.h_layer(h_in)  # (n_obs, code_dim)
-
-            # Fill observed indices in full output
-            h_out_full[b, obs_idx] = h_out
-
-        # ─── step 3: compute per-junction gate scores ───────────────────
-        raw_gates = self.gate_net(h_out_full)  # (B, D, 1)
-
-        if self.junction_inclusion == "observed_junctions":
-            raw_gates = raw_gates.masked_fill((mask == 0).unsqueeze(-1), float('-1e9'))
-
-        # softmax over junctions D
-        weights = torch.softmax(raw_gates.squeeze(-1), dim=1)  # (B, D)
-
-        # weighted sum as usual
-        w_exp = weights.unsqueeze(-1)  # (B, D, 1)
-        c = (h_out_full * w_exp).sum(dim=1)  # (B, code_dim)
-
-        # ─── step 5: your encoder MLP as before ────────────────────────
-        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
-        mu, logvar = mu_logvar.chunk(2, dim=-1)
-        return mu, logvar
-
-
-class PartialEncoderWeightedSumEDDIMultiWeight(nn.Module):
-    """
-    EDDI-style encoder that for each junction produces W weightings (instead of a single scalar),
-    yielding W separate weighted sums of per-junction codes, and then learns to pool those W
-    intermediate vectors into a final code via a linear combiner.
+    After calling `register_junc2atse`, the sparse mapping is stored, and the gate network
+    is rebuilt to accept [per-junction code_dim] + [num_ATSEs] inputs.
     """
     def __init__(
         self,
-        input_dim: int,
-        code_dim: int,
+        input_dim: int,           # J
+        code_dim: int,            # D
         h_hidden_dim: int,
         encoder_hidden_dim: int,
         latent_dim: int,
@@ -1298,26 +500,22 @@ class PartialEncoderWeightedSumEDDIMultiWeight(nn.Module):
         n_cat_list: Iterable[int] | None = None,
         n_cont: int = 0,
         inject_covariates: bool = True,
-        junction_inclusion: str = "all_junctions",  # "all_junctions" or "observed_junctions"
+        temperature_value: float = 1,
+        temperature_fixed: bool = True, #if temperature is fixed, it is fixed to the value of temperature_value
     ):
         super().__init__()
-        assert junction_inclusion in ("all_junctions", "observed_junctions")
+        self.code_dim = code_dim
+        self.num_weight_vectors = num_weight_vectors
+        self.temperature_value = temperature_value
+        self.temperature_fixed = temperature_fixed
         self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
         self.n_cont = n_cont
         self.inject_covariates = inject_covariates
-        self.code_dim = code_dim
-        self.junction_inclusion = junction_inclusion
-        self.num_weight_vectors = num_weight_vectors
-
-        if self.junction_inclusion == "all_junctions":
-            print("Including all junctions into multi-weighted sum")
-        else:
-            print("Using only observed junctions for multi-weighted sum")
 
         # per-junction embeddings
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
 
-        # shared h-network: [psi, embedding] -> code_dim
+        # shared h-layer computes per-junction codes
         in_dim = 1 + code_dim
         self.h_layer = nn.Sequential(
             nn.Linear(in_dim, h_hidden_dim),
@@ -1329,19 +527,22 @@ class PartialEncoderWeightedSumEDDIMultiWeight(nn.Module):
             nn.ReLU(),
         )
 
-        # gate_net now outputs W scores per junction
+        # initial gate net takes only code_dim; will be rebuilt after register_junc2atse
         self.gate_net = nn.Sequential(
             nn.Linear(code_dim, code_dim // 2),
             nn.ReLU(),
-            nn.Linear(code_dim // 2, num_weight_vectors),  # (n_obs, W)
+            nn.Linear(code_dim // 2, self.num_weight_vectors),
         )
 
-        # combiner: collapse W * code_dim -> code_dim
-        self.combiner = nn.Sequential(
-            nn.Linear(num_weight_vectors * code_dim, code_dim),
-            nn.LayerNorm(code_dim),
-            nn.ReLU(),
-        )
+        # combiner: (W * D) -> D
+        if self.num_weight_vectors == 1:
+            self.combiner = nn.Identity()
+        else:
+            self.combiner = nn.Sequential(
+                nn.Linear(self.num_weight_vectors * self.code_dim, self.code_dim),
+                nn.LayerNorm(self.code_dim),
+                nn.ReLU(),
+            )
 
         # final encoder MLP
         self.encoder_mlp = FCLayers(
@@ -1357,254 +558,164 @@ class PartialEncoderWeightedSumEDDIMultiWeight(nn.Module):
             inject_covariates=inject_covariates,
         )
 
+        # buffers for ATSE mapping
+        self.register_buffer("junc2atse", torch.sparse_coo_tensor(size=(input_dim, 0)))
+        self.register_buffer("j2a_t", torch.sparse_coo_tensor(size=(0, input_dim)))
+        self.n_atse = 0
+
+    @torch.no_grad()
+    def register_junc2atse(self, junc2atse: torch.sparse.Tensor):
+        # Store and coalesce mapping
+        j2a = junc2atse.coalesce().to(self.feature_embedding.device)
+        self.register_buffer("junc2atse", j2a)
+        # Transpose for pooling
+        self.register_buffer("j2a_t", j2a.transpose(0, 1).coalesce())
+        # Determine number of ATSEs
+        _, atse_idx = j2a.indices()
+        self.n_atse = int(atse_idx.max().item()) + 1
+        # Rebuild gate network to accept code_dim + n_atse inputs
+        in_dim = self.code_dim + self.n_atse
+        self.gate_net = nn.Sequential(
+            nn.Linear(in_dim, in_dim // 2),
+            nn.ReLU(),
+            nn.Linear(in_dim // 2, self.num_weight_vectors),
+        )
+
     def forward(
         self,
-        x: torch.Tensor,                # (B, D)
-        mask: torch.Tensor,             # (B, D)
-        *cat_list: torch.Tensor,        # each (B,1)
-        cont: torch.Tensor | None = None,  # (B, n_cont)
+        x: torch.Tensor,   # (B, J)
+        mask: torch.Tensor, # (B, J)
+        *cat_list,
+        cont: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, D = x.shape
+        B, J = x.shape
         device = x.device
         outputs = []
 
         for b in range(B):
-            if self.junction_inclusion == "observed_junctions":
-                obs_idx = mask[b].bool()  # (D,)
-            else:
-                obs_idx = torch.ones(D, dtype=torch.bool, device=device)  # all junctions
-
-            if obs_idx.sum() == 0:
-                # fallback: no observed junctions
+            # select observed junctions
+            obs_idx = mask[b].bool()
+            n_obs = obs_idx.sum().item()
+            if n_obs == 0:
                 outputs.append(torch.zeros(self.code_dim, device=device))
                 continue
 
-            x_obs = x[b, obs_idx]                     # (n_obs,)
-            F_obs = self.feature_embedding[obs_idx]    # (n_obs, code_dim)
+            # slice values and embeddings
+            x_obs = x[b, obs_idx]
+            F_obs = self.feature_embedding[obs_idx]
+            # compute per-junction codes
+            h_in = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)
+            h_out = self.h_layer(h_in)  # (n_obs, D)
 
-            # per-junction code
-            h_in = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)  # (n_obs, 1 + code_dim)
-            h_out = self.h_layer(h_in)                            # (n_obs, code_dim)
+            # prepare ATSE one-hot
+            atse_sparse = self.junc2atse.index_select(0, obs_idx.nonzero(as_tuple=True)[0])
+            atse_oh = atse_sparse.to_dense().to(device)  # (n_obs, A)
 
-            # produce W raw gate scores per junction: (n_obs, W)
-            raw_gates = self.gate_net(h_out)  # (n_obs, W)
+            # temperature from mean code
+            mean_h = h_out.mean(dim=0)
+            
 
-            # normalize over junctions for each of the W weight vectors
-            weights = torch.softmax(raw_gates, dim=0)  # (n_obs, W); softmax over junctions
+            # gate inputs include code + ATSE one-hot
+            gate_in = torch.cat([h_out, atse_oh], dim=1)
+            raw_gates = self.gate_net(gate_in)  # (n_obs, W)
 
-            # compute W aggregated vectors: (W, code_dim)
-            # weights.T: (W, n_obs) -> unsqueeze(-1): (W, n_obs, 1)
-            # h_out: (n_obs, code_dim) -> unsqueeze(0): (1, n_obs, code_dim)
-            head_sums = (weights.T.unsqueeze(-1) * h_out.unsqueeze(0)).sum(dim=1)  # (W, code_dim)
+            # neighbor scaling
+            if self.temperature_fixed:
+                neighbor_scale = self.temperature_value
+            else:
+                neighbor_scale = 1.0 / torch.sqrt(torch.tensor(n_obs, device=device).float().clamp(min=1.0))
+            logits = (raw_gates * neighbor_scale) 
+            logits = logits.clamp(min=-10.0, max=10.0)
 
-            # flatten and combine: (W * code_dim,) -> code_dim
-            combined = self.combiner(head_sums.reshape(-1))  # (code_dim,)
+            # normalize over junctions
+            weights = torch.softmax(logits, dim=0)  # (n_obs, W)
 
+            # head-wise weighted sums
+            head_sums = (weights.transpose(0, 1).unsqueeze(-1) * h_out.unsqueeze(0)).sum(dim=1)
+            combined = self.combiner(head_sums.reshape(-1))
             outputs.append(combined)
 
-        c = torch.stack(outputs, dim=0)  # (B, code_dim)
-
-        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # (B, 2*latent_dim)
+        c = torch.stack(outputs, dim=0)
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
         mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
 
 
 
-class PartialEncoderImpute(nn.Module):
+class PartialEncoderWeightedSumEDDIMultiWeight(nn.Module):
+    """
+    EDDI-style encoder that for each junction produces W weight vectors, yielding W separate
+    weighted sums of per-junction codes. Those W head-sums are then combined via a learned
+    linear combiner into a final code.
+
+    Dimensions:
+        B: batch size (cells)
+        J: number of junctions
+        D: code_dim (size of per-junction code vectors)
+        W: number of weight vectors / heads
+    """
     def __init__(
         self,
-        input_dim: int,           
-        code_dim: int,
+        input_dim: int,  # J
+        code_dim: int,   # D
         h_hidden_dim: int,
+        encoder_hidden_dim: int,
         latent_dim: int,
-        encoder_hidden_dim: int,      # ← re-introduced
+        num_weight_vectors: int = 4,  # W
         dropout_rate: float = 0.0,
         n_cat_list: Iterable[int] | None = None,
         n_cont: int = 0,
         inject_covariates: bool = True,
-        junction_inclusion: str = "all_junctions",
+        temperature_value: float = 1.0,
+        temperature_fixed: bool = True, #if temperature is fixed, it is fixed to the value of temperature_value
     ):
         super().__init__()
-        # per-junction embedding
-        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
-        self.code_dim = code_dim
-        self.finished_training = False
-        self.junction_inclusion = junction_inclusion
-        if self.junction_inclusion == "observed_junctions":
-            print("Only Imputing for Non Observed Junctions")
-        elif self.junction_inclusion == "all_junctions":
-            print("Imputing for All Junctions")
-        # combine [psi_value, embedding] → code_dim
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        self.code_dim = code_dim  # code dimension
+        self.num_weight_vectors = num_weight_vectors
+        self.temperature_value = temperature_value
+        self.temperature_fixed = temperature_fixed
+
+
+        # per-junction embeddings (J, D)
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, self.code_dim))
+
+        # h-layer: [psi, embedding] -> D
+        in_dim = 1 + self.code_dim
         self.h_layer = nn.Sequential(
-            nn.Linear(1 + code_dim, h_hidden_dim),
+            nn.Linear(in_dim, h_hidden_dim),
             nn.LayerNorm(h_hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(h_hidden_dim, code_dim),
-            nn.LayerNorm(code_dim),
+            nn.Linear(h_hidden_dim, self.code_dim),
+            nn.LayerNorm(self.code_dim),
             nn.ReLU(),
         )
-        # collapse code_dim → 1 scalar ∈ [0,1]
-        self.impute_net = nn.Sequential(
-            nn.Linear(code_dim, code_dim // 2),
+
+        # gate outputs W scores per junction: (n_obs, W)
+        self.gate_net = nn.Sequential(
+            nn.Linear(self.code_dim, self.code_dim // 2),
             nn.ReLU(),
-            nn.Linear(code_dim // 2, 1),
-            nn.Sigmoid(),
+            nn.Linear(self.code_dim // 2, self.num_weight_vectors),
         )
-        # now our “new x” has shape (B, D) → feed into encoder_mlp
+
+        # combiner: (W * D) -> D
+        if self.num_weight_vectors == 1:
+            self.combiner = nn.Identity()
+        else:
+            self.combiner = nn.Sequential(
+                nn.Linear(self.num_weight_vectors * self.code_dim, self.code_dim),
+                nn.LayerNorm(self.code_dim),
+                nn.ReLU(),
+            )
+
+        # final encoder MLP
         self.encoder_mlp = FCLayers(
-            n_in       = input_dim,
-            n_out      = 2 * latent_dim,
-            n_cat_list = list(n_cat_list or []),
-            n_cont     = n_cont,
-            n_layers   = 2,
-            n_hidden   = encoder_hidden_dim,  # use your passed-in hidden size    
-            dropout_rate=dropout_rate,
-            use_batch_norm=False,
-            use_layer_norm=True,
-            inject_covariates=inject_covariates,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,    # (B, D)
-        mask: torch.Tensor, # (B, D)
-        *cat_list,
-        cont: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, D = x.shape
-        # 1) build per-junction features
-        x_flat  = x.reshape(-1,1)                              # (B*D,1)
-        F_flat  = self.feature_embedding.unsqueeze(0)          # (1,D,code_dim)
-        F_flat  = F_flat.expand(B, D, -1).reshape(-1, F_flat.size(-1))  # (B*D,code_dim)
-        h_in    = torch.cat([x_flat, F_flat], dim=1)           # (B*D,1+code_dim)
-
-        # 2) per-junction embedding → (B, D, code_dim)
-        h_out   = self.h_layer(h_in).view(B, D, -1)
-
-        # 3) collapse each code_dim vector to a scalar ∈ [0,1]
-        x_imp   = self.impute_net(h_out).squeeze(-1)           # (B, D)
-
-
-        # only compute & print Pearson‐R when in eval mode, once
-        if self.finished_training and not hasattr(self, "_corr_printed"):
-            orig = x.reshape(-1)               # (B*D,)
-            pred = x_imp.reshape(-1)           # (B*D,)
-
-            # Pearson‐R
-            vx, vy = orig - orig.mean(), pred - pred.mean()
-            corr = (vx * vy).sum() / torch.sqrt((vx**2).sum() * (vy**2).sum() + 1e-8)
-            print(f"[Eval] impute_net PearsonR = {corr.item():.4f}")
-
-            # Quartiles for predictions where original == 0
-            zero_mask = orig == 0
-            if zero_mask.any():
-                # get just the preds where orig was zero
-                preds_zero = pred[zero_mask]
-                # compute 25th, 50th, 75th percentiles
-                qs = torch.quantile(preds_zero, torch.tensor([0.25, 0.50, 0.75], device=pred.device))
-                q25, q50, q75 = qs.tolist()
-                print(
-                    f"[Eval] pred quartiles (orig==0): "
-                    f"25%={q25:.4f}, median={q50:.4f}, 75%={q75:.4f}"
-                )
-            else:
-                print("[Eval] no entries with orig==0 to compute quartiles.")
-
-            self._corr_printed = True
-
-
-        # 4) optional: keep original where observed
-        if self.junction_inclusion == "observed_junctions":
-            x_imp = x_imp * (1-mask) + x * mask
-            
-
-        # 5) feed your original encoder MLP on shape (B, D)
-        mu_logvar = self.encoder_mlp(x_imp, *cat_list, cont=cont)
-        mu, logvar = mu_logvar.chunk(2, dim=-1)
-        return mu, logvar
-
-
-
-class PartialEncoderTransformer(nn.Module):
-    """
-    Transformer-based encoder that embeds every possible junction,
-    attends over the subset observed in each cell, then maps the
-    aggregated representation to VAE latent parameters (μ, log σ²).
-
-    Args
-    ----
-    input_dim : int
-        Number of distinct junctions J.
-    code_dim : int
-        Size D of each learned junction embedding.
-    latent_dim : int
-        Size Z of the downstream latent space.
-    encoder_hidden_dim : int
-        Hidden width inside the two-layer MLP that produces [μ‖log σ²].
-    dropout_rate : float
-        Dropout used inside Transformer feed-forward blocks.
-    n_cat_list : Iterable[int] | None
-        Sizes of one-hot categorical covariates (e.g. batch).
-    n_cont : int
-        Number of continuous covariates.
-    inject_covariates : bool
-        Whether FCLayers should append covariates to the first layer.
-    n_heads : int
-        Number of self-attention heads.
-    ff_dim : int | None
-        Inner width of Transformer feed-forward network; defaults to 4×D.
-    num_transformer_layers : int
-        How many encoder layers to stack.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        code_dim: int,
-        latent_dim: int,
-        encoder_hidden_dim: int,
-        dropout_rate: float = 0.0,
-        n_cat_list: Iterable[int] | None = None,
-        n_cont: int = 0,
-        inject_covariates: bool = True,
-        n_heads: int = 2,
-        ff_dim: int | None = None,
-        num_transformer_layers: int = 1,
-    ):
-        super().__init__()
-
-        # ------------------------------------------------------------------ #
-        # 1. Junction “identity” embeddings                                  #
-        # ------------------------------------------------------------------ #
-        self.feature_embedding = nn.Parameter(
-            torch.empty(input_dim, code_dim)
-        )
-        self.code_dim = code_dim
-        nn.init.xavier_uniform_(self.feature_embedding)  # swap in PCA init if available
-
-        # ------------------------------------------------------------------ #
-        # 2. Transformer over observed-junction tokens                       #
-        # ------------------------------------------------------------------ #
-        ff_dim = ff_dim or (code_dim * 4)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=code_dim,
-            nhead=n_heads,
-            dim_feedforward=ff_dim,
-            dropout=dropout_rate,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_transformer_layers
-        )
-
-        # ------------------------------------------------------------------ #
-        # 3. MLP → latent μ, logσ²                                           #
-        # ------------------------------------------------------------------ #
-        self.encoder_mlp = FCLayers(
-            n_in=code_dim,
+            n_in=self.code_dim,
             n_out=2 * latent_dim,
-            n_cat_list=list(n_cat_list or []),
+            n_cat_list=n_cat_list or [],
             n_cont=n_cont,
             n_layers=2,
             n_hidden=encoder_hidden_dim,
@@ -1614,135 +725,62 @@ class PartialEncoderTransformer(nn.Module):
             inject_covariates=inject_covariates,
         )
 
-    # ---------------------------------------------------------------------- #
-    # Forward                                                                #
-    # ---------------------------------------------------------------------- #
-    # def forward(
-    #     self,
-    #     x: torch.Tensor,          # (B, J)   – PSI / expression values ∈ [0, 1]
-    #     mask: torch.Tensor,       # (B, J)   – 1 where observed
-    #     *cat_list: torch.Tensor,  # optional categorical covariates
-    #     cont: torch.Tensor | None = None,  # optional continuous covariates
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-    #     """
-    #     Returns
-    #     -------
-    #     mu, logvar : (B, Z) tensors
-    #         Mean and log-variance of q(z | x) for each cell.
-    #     """
-    #     B, J = x.shape
-    #     device = x.device
-    #     cell_reprs = []
-
-    #     for b in range(B):
-    #         obs_idx = mask[b].nonzero(as_tuple=False).squeeze(1)  # (n_obs,)
-    #         if obs_idx.numel() == 0:
-    #             # If a cell somehow has no observed junctions, fall back to zeros
-    #             cell_reprs.append(torch.zeros(self.feature_embedding.size(1),
-    #                                           device=device))
-    #             continue
-
-    #         # (n_obs, D) embeddings × scalar PSI
-    #         tokens = (
-    #             self.feature_embedding[obs_idx] *
-    #             x[b, obs_idx].unsqueeze(-1)
-    #         )  # shape (n_obs, D)
-
-    #         # Transformer expects (batch, seq, dim)
-    #         attended = self.transformer(tokens.unsqueeze(0))  # (1, n_obs, D)
-
-    #         # Mean-pool over the variable-length sequence → (D,)
-    #         cell_repr = attended.mean(dim=1).squeeze(0)
-    #         cell_reprs.append(cell_repr)
-
-    #     # Stack back into (B, D)
-    #     c = torch.stack(cell_reprs, dim=0)
-
-    #     # Project to latent parameters
-    #     mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
-    #     mu, logvar = mu_logvar.chunk(2, dim=-1)
-    #     return mu, logvar
-
     def forward(
         self,
-        x: torch.Tensor,              # (B, J)
-        mask: torch.Tensor,           # (B, J)
+        x: torch.Tensor,                # (B, J)
+        mask: torch.Tensor,             # (B, J)
         *cat_list: torch.Tensor,
         cont: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # --- call counter to limit prints ---
-        if not hasattr(self, "_fw_calls"):
-            self._fw_calls = 0
-        self._fw_calls += 1
-        do_print = self._fw_calls <= 10
-
-        import time
-        t0 = time.time()
-
         B, J = x.shape
         device = x.device
+        D = self.code_dim
+        W = self.num_weight_vectors
 
-        # 1) compute lengths and update max_obs
-        t1 = time.time()
-        mask_long = mask.to(torch.long)           # (B, J)
-        lengths   = mask_long.sum(dim=1)          # (B,)
-        batch_max = int(lengths.max().item())
-        if not hasattr(self, "max_obs"):
-            self.max_obs = batch_max
-        else:
-            self.max_obs = max(self.max_obs, batch_max)
-        L = self.max_obs
-        t2 = time.time()
+        outputs = []  # will collect (D,) per cell
+        for b in range(B):          
+            obs_idx = mask[b].bool()  # (J,)
 
-        # 2) topk indices
-        _, idxs = mask_long.topk(L, dim=1)        # (B, L)
-        t3 = time.time()
+            n_obs = obs_idx.sum()
+            if n_obs == 0:
+                outputs.append(torch.zeros(D, device=device))
+                continue
 
-        # 3) gather embeddings & weights
-        emb_tokens = self.feature_embedding[idxs]            # (B, L, D)
-        x_weights  = x.gather(1, idxs).unsqueeze(-1)         # (B, L, 1)
-        tokens     = emb_tokens * x_weights                  # (B, L, D)
-        t4 = time.time()
+            x_obs = x[b, obs_idx]  # (n_obs,)
+            F_obs = self.feature_embedding[obs_idx]  # (n_obs, D)
 
-        # 4) build pad mask
-        pad_mask = (
-            torch.arange(L, device=device)[None, :].expand(B, L)
-            >= lengths[:, None]
-        )                                                    # (B, L)
-        t5 = time.time()
+            h_in = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)  # (n_obs, 1 + D)
+            h_out = self.h_layer(h_in)  # (n_obs, D)
 
-        # 5) transformer
-        out = self.transformer(tokens, src_key_padding_mask=pad_mask)
-        t6 = time.time()
+            # temperature from mean observed h_out
+            mean_h = h_out.mean(dim=0)  # (D,)
 
-        # 6) masked mean‐pool
-        keep   = (~pad_mask).unsqueeze(-1).float()           # (B, L, 1)
-        summed = (out * keep).sum(dim=1)                     # (B, D)
-        c      = summed / (lengths.unsqueeze(-1).float() + 1e-8)
-        t7 = time.time()
+            # raw gate scores: (n_obs, W)
+            raw_gates = self.gate_net(h_out)  # (n_obs, W)
 
-        # 7) MLP → [μ‖log σ²]
-        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
+            # neighbor scaling
+            if self.temperature_fixed:
+                neighbor_scale = self.temperature_value
+            else:
+                neighbor_scale = 1.0 / torch.sqrt(torch.tensor(n_obs, device=device).float().clamp(min=1.0))
+            logits = (raw_gates * neighbor_scale) 
+            logits = logits.clamp(min=-10.0, max=10.0)
+
+            # softmax over junctions for each head: dim=0 → (n_obs, W)
+            weights = torch.softmax(logits, dim=0)  # (n_obs, W)
+
+            # head sums: for each of W heads, weighted sum over junction codes -> (W, D)
+            # weights.T: (W, n_obs), h_out: (n_obs, D)
+            head_sums = (weights.T.unsqueeze(-1) * h_out.unsqueeze(0)).sum(dim=1)  # (W, D)
+
+            # flatten and combine to code vector: (W * D,) -> (D,)
+            combined = self.combiner(head_sums.reshape(-1))  # (D,)
+            outputs.append(combined)
+
+        c = torch.stack(outputs, dim=0)  # (B, D)
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # (B, 2*latent)
         mu, logvar = mu_logvar.chunk(2, dim=-1)
-        t8 = time.time()
-
-        # print timing breakdown for first few forwards
-        # ── print timing + max_obs for first few forwards ─────────────────
-        if do_print:
-            print(
-                f"[Forward #{self._fw_calls}] total={t8-t0:.4f}s  "
-                f"max_obs={self.max_obs}  "
-                f"len={t2-t1:.4f}s  topk={t3-t2:.4f}s  "
-                f"gather={t4-t3:.4f}s  mask={t5-t4:.4f}s  "
-                f"transform={t6-t5:.4f}s  pool={t7-t6:.4f}s  "
-                f"mlp={t8-t7:.4f}s"
-            )
-
         return mu, logvar
-
-
-
-
 
 class LinearDecoder(nn.Module):
     def __init__(
@@ -1860,22 +898,18 @@ class PARTIALVAE(BaseModuleClass):
         ff_dim: int | None = None,
         num_transformer_layers: int = 2,
         encoder_type: Literal[
-            "PartialEncoder",
-            "PartialEncoderImpute",
-            "PartialEncoderWeightedSum",
-            "PartialEncoderWeightedSumEDDI",
-            "PartialEncoderTransformer",
             "PartialEncoderEDDI",
             "PartialEncoderEDDIATSE",
-            "PartialEncoderEDDIATSEL",
-            "PartialEncoderEDDIGNN",
-        ] = "PartialEncoder",
-        junction_inclusion: Literal["all_junctions", "observed_junctions"] = "all_junctions",
+            "PartialEncoderWeightedSumEDDIMultiWeight",
+            "PartialEncoderWeightedSumEDDIMultiWeightATSE",
+        ] = "PartialEncoderEDDI",
         pool_mode: Literal["mean","sum"] = "mean",
+        num_weight_vectors: int = 4,
+        temperature_value: float = 1.0, #if temperature_value is set to -1, then the median number of observations is used as the fixed temperature value.
+        temperature_fixed: bool = True, #if temperature is fixed, it is fixed to the value of temperature_value
     ):
         super().__init__()
         self.encoder_type = encoder_type
-        self.junction_inclusion = junction_inclusion
 
         # Store high-level flags
         self.encode_covariates = encode_covariates
@@ -1909,21 +943,7 @@ class PARTIALVAE(BaseModuleClass):
         print(f"Using code_dim={code_dim}!")
 
         # instantiate the requested encoder
-        if encoder_type == "PartialEncoder":
-            print(f"Using Regular Partial Encoder")
-            self.encoder = PartialEncoder(
-                input_dim=n_input,
-                code_dim=code_dim,
-                h_hidden_dim=h_hidden_dim,
-                encoder_hidden_dim=encoder_hidden_dim,
-                latent_dim=n_latent,
-                dropout_rate=dropout_rate,
-                n_cat_list=encoder_cat_list,
-                n_cont=n_continuous_cov,
-                inject_covariates=encode_covariates,
-                pool_mode=pool_mode,
-            )
-        elif encoder_type == "PartialEncoderEDDI":
+        if encoder_type == "PartialEncoderEDDI":
             print(f"Using EDDI Partial Encoder")
             self.encoder = PartialEncoderEDDI(
                 input_dim=n_input,
@@ -1953,9 +973,9 @@ class PARTIALVAE(BaseModuleClass):
                 pool_mode=pool_mode,
             )
         
-        elif encoder_type == "PartialEncoderEDDIATSEL":
-            print("Using EDDI + ATSE Partial Encoder with Latent ATSE Dim")
-            self.encoder = PartialEncoderEDDIATSEL(
+        elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
+            print("Using PartialEncoderWeightedSumEDDIMultiWeight")
+            self.encoder = PartialEncoderWeightedSumEDDIMultiWeight(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
@@ -1965,14 +985,14 @@ class PARTIALVAE(BaseModuleClass):
                 n_cat_list=encoder_cat_list,
                 n_cont=n_continuous_cov,
                 inject_covariates=encode_covariates,
-                pool_mode=pool_mode,
+                num_weight_vectors = num_weight_vectors,
+                temperature_value=temperature_value,
+                temperature_fixed=temperature_fixed,
             )
 
-        elif encoder_type == "PartialEncoderEDDIGNN":
-            print("Using EDDI + GNN Partial Encoder")
-            # assume you’ve already built `junc2atse_edge_index` from your sparse junc2atse:
-            #    junc2atse_edge_index = junc2atse._indices()
-            self.encoder = PartialEncoderEDDIGNN(
+        elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
+            print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE")
+            self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSE(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
@@ -1982,72 +1002,11 @@ class PARTIALVAE(BaseModuleClass):
                 n_cat_list=encoder_cat_list,
                 n_cont=n_continuous_cov,
                 inject_covariates=encode_covariates,
-                pool_mode=pool_mode,
-                # GNN‑specific args:
-                gnn_layers=2,
-                gnn_epochs=10,
-            )
-
-        elif encoder_type == "PartialEncoderImpute":
-            print("Using Impute encoder")
-            self.encoder = PartialEncoderImpute(
-                input_dim=n_input,
-                code_dim=code_dim,
-                h_hidden_dim=h_hidden_dim,
-                encoder_hidden_dim=encoder_hidden_dim,
-                latent_dim=n_latent,
-                dropout_rate=dropout_rate,
-                n_cat_list=encoder_cat_list,
-                n_cont=n_continuous_cov,
-                inject_covariates=encode_covariates,
-                junction_inclusion=junction_inclusion,
-            )
-        elif encoder_type == "PartialEncoderWeightedSum":
-            print("Using WeightedSum encoder")
-            self.encoder = PartialEncoderWeightedSum(
-                input_dim=n_input,
-                code_dim=code_dim,
-                h_hidden_dim=h_hidden_dim,
-                encoder_hidden_dim=encoder_hidden_dim,
-                latent_dim=n_latent,
-                dropout_rate=dropout_rate,
-                n_cat_list=encoder_cat_list,
-                n_cont=n_continuous_cov,
-                inject_covariates=encode_covariates,
-                junction_inclusion=junction_inclusion,
+                num_weight_vectors = num_weight_vectors,
+                temperature_value=temperature_value,
+                temperature_fixed=temperature_fixed,
             )
         
-        elif encoder_type == "PartialEncoderWeightedSumEDDI":
-            print("Using WeightedSum encoder EDDI version")
-
-            self.encoder = PartialEncoderWeightedSumEDDI(
-                input_dim=n_input,
-                code_dim=code_dim,
-                h_hidden_dim=h_hidden_dim,
-                encoder_hidden_dim=encoder_hidden_dim,
-                latent_dim=n_latent,
-                dropout_rate=dropout_rate,
-                n_cat_list=encoder_cat_list,
-                n_cont=n_continuous_cov,
-                inject_covariates=encode_covariates,
-                junction_inclusion=junction_inclusion,
-            )
-
-        elif encoder_type == "PartialEncoderTransformer":
-            print("Using Transformer encoder")
-            self.encoder = PartialEncoderTransformer(
-                input_dim=n_input,
-                code_dim=code_dim,
-                encoder_hidden_dim=encoder_hidden_dim,
-                latent_dim=n_latent,
-                dropout_rate=dropout_rate,
-                n_cat_list=encoder_cat_list,
-                n_cont=n_continuous_cov,
-                inject_covariates=encode_covariates,
-                n_heads=n_heads,
-                ff_dim=ff_dim,
-                num_transformer_layers=num_transformer_layers,
-            )
         else:
             raise ValueError(f"Unknown encoder_type={encoder_type!r}")
             
