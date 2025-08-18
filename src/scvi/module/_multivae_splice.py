@@ -12,7 +12,7 @@ from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial, NegativeBinomialMixture, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers, LinearDecoderSCVI
-from scvi.module._partialvae import PartialEncoder, PartialEncoderImpute, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
+from scvi.module._partialvae import PartialEncoderEDDI, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
 
 from ._utils import masked_softmax
 
@@ -365,7 +365,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             # inject_covariates=encode_covariates,
             # )
 
-            self.z_encoder_splicing = PartialEncoderImpute(
+            self.z_encoder_splicing = PartialEncoderEDDI(
                 input_dim=input_spl,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
@@ -375,7 +375,6 @@ class MULTIVAESPLICE(BaseModuleClass):
                 n_cat_list=encoder_cat_list,
                 n_cont=n_continuous_cov,
                 inject_covariates=encode_covariates,
-                junction_inclusion="all_junctions",       # or "observed_junctions"
             )
 
             if latent_distribution == "ln":

@@ -737,6 +737,11 @@ class PartialEncoderWeightedSumEDDIMultiWeight(nn.Module):
         D = self.code_dim
         W = self.num_weight_vectors
 
+        # inside forward(), right after you unpack (B, J)
+        if (mask.sum(dim=1) == 0).any():
+            bad_idx = (mask.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+            print(f"[Warning] Found {bad_idx.numel()} cells in batch with 0 observed junctions: {bad_idx.tolist()}")
+
         outputs = []  # will collect (D,) per cell
         for b in range(B):          
             obs_idx = mask[b].bool()  # (J,)
@@ -781,6 +786,600 @@ class PartialEncoderWeightedSumEDDIMultiWeight(nn.Module):
         mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)  # (B, 2*latent)
         mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
+
+
+# ===============================
+# FAST VARIANTS (batched, masked)
+# ===============================
+
+class PartialEncoderEDDIFast(nn.Module):
+    """
+    Fast EDDI-style partial encoder (batched).
+    Changes vs. PartialEncoderEDDI:
+      - Processes all junctions (no per-cell Python loop).
+      - Uses psi_mask to exclude unobserved junctions from pooling.
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        pool_mode: Literal["mean","sum"] = "mean",
+    ):
+        super().__init__()
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        self.code_dim = code_dim
+        self.pool_mode = pool_mode
+
+        # per-feature embeddings (J, D)
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+        # shared h-network sees [psi, embedding]
+        in_dim = 1 + code_dim
+        self.h_layer = nn.Sequential(
+            nn.Linear(in_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(h_hidden_dim, code_dim),
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
+        )
+
+        # cell-level encoder MLP
+        self.encoder_mlp = FCLayers(
+            n_in=code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=n_cat_list or [],
+            n_cont=n_cont,
+            n_layers=2,
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,       # (B, J)
+        mask: torch.Tensor,    # (B, J) 1=observed, 0=missing
+        *cat_list: torch.Tensor,
+        cont: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, J = x.shape
+        D = self.code_dim
+        device = x.device
+        # inside forward(), right after you unpack (B, J)
+        if (mask.sum(dim=1) == 0).any():
+            bad_idx = (mask.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+            print(f"[Warning] Found {bad_idx.numel()} cells in batch with 0 observed junctions: {bad_idx.tolist()}")
+
+        mask_bool = mask.bool()                     # (B, J)
+        F = self.feature_embedding                  # (J, D)
+        x_exp = x.unsqueeze(-1)                     # (B, J, 1)
+        F_exp = F.unsqueeze(0).expand(B, J, D)      # (B, J, D)
+
+        h_in = torch.cat([x_exp, F_exp], dim=-1)    # (B, J, 1+D)
+        # Flatten batch+junction for MLP, then reshape back
+        h_out = self.h_layer(h_in.view(B * J, -1)).view(B, J, D)  # (B, J, D)
+
+        # Mask out unobserved junctions from pooling
+        masked_h = h_out * mask_bool.unsqueeze(-1)  # (B, J, D)
+        pooled = masked_h.sum(dim=1)                # (B, D)
+
+        if self.pool_mode == "mean":
+            denom = mask_bool.sum(dim=1, keepdim=True).clamp(min=1)  # (B,1)
+            c = pooled / denom                                       # (B, D)
+        else:
+            c = pooled
+
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)        # (B, 2*latent)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Iterable, Literal
+from scvi.nn import FCLayers
+
+class PartialEncoderEDDIATSEFast(nn.Module):
+    """
+    Fast EDDI + ATSE-embedding encoder (batched).
+
+    - Per-junction embeddings: (J, D)
+    - Per-ATSE embeddings: (A, Ae) as a trainable nn.Parameter
+    - ATSE indices for each junction derived on the fly from self.junc2atse
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        pool_mode: Literal["mean","sum"] = "mean",
+        atse_embedding_dimension: int = 16,
+    ):
+        super().__init__()
+        self.code_dim = code_dim
+        self.h_hidden_dim = h_hidden_dim
+        self.dropout_rate = dropout_rate
+        self.pool_mode = pool_mode
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        self.atse_embedding_dimension = int(atse_embedding_dimension)
+
+        # Per-junction embeddings
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+        # Placeholder h-layer; rebuilt after register_junc2atse()
+        self.h_layer = self._make_h_layer(n_atse_embed=0)
+
+        # Encoder MLP
+        self.encoder_mlp = FCLayers(
+            n_in=code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=n_cat_list or [],
+            n_cont=n_cont,
+            n_layers=2,
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+        # Sparse mapping rows=junctions (J), cols=ATSEs (A)
+        self.register_buffer("junc2atse", torch.sparse_coo_tensor(size=(input_dim, 0)))
+        self.n_atse = 0
+
+        # ATSE embeddings (Parameter) will be created in register_junc2atse
+        self.atse_embedding: torch.nn.Parameter | None = None
+
+    def _make_h_layer(self, n_atse_embed: int) -> nn.Sequential:
+        in_dim = 1 + self.code_dim + n_atse_embed
+        return nn.Sequential(
+            nn.Linear(in_dim, self.h_hidden_dim),
+            nn.LayerNorm(self.h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.h_hidden_dim, self.code_dim),
+            nn.LayerNorm(self.code_dim),
+            nn.ReLU(),
+        )
+
+    @torch.no_grad()
+    def register_junc2atse(self, junc2atse: torch.sparse.Tensor):
+        """
+        Provide the (J x A) sparse mapping (one nonzero per junction).
+        Builds ATSE embeddings (Parameter) and rebuilds h_layer to accept Ae dims.
+        """
+        j2a = junc2atse.coalesce().to(self.feature_embedding.device)
+        self.register_buffer("junc2atse", j2a)
+
+        # Number of ATSEs
+        _, idx_g = j2a.indices()
+        self.n_atse = int(idx_g.max().item()) + 1 if idx_g.numel() > 0 else 0
+
+        if self.n_atse == 0:
+            self.atse_embedding = None
+            self.h_layer = self._make_h_layer(n_atse_embed=0)
+        else:
+            # Create ATSE Embeddings Parameter 
+            self.atse_embedding = nn.Parameter(
+                torch.randn(self.n_atse, self.atse_embedding_dimension, device=j2a.device)
+            )
+            self.h_layer = self._make_h_layer(n_atse_embed=self.atse_embedding_dimension)
+
+    def forward(
+        self,
+        x: torch.Tensor,       # (B, J) psi or similar scalar per junction
+        mask: torch.Tensor,    # (B, J) 1=observed, 0=missing
+        *cat_list: torch.Tensor,
+        cont: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, J = x.shape
+        D = self.code_dim
+        device = x.device
+
+        # Warn if a cell has zero observed junctions
+        if (mask.sum(dim=1) == 0).any():
+            bad_idx = (mask.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+            print(f"[Warning] Found {bad_idx.numel()} cells in batch with 0 observed junctions: {bad_idx.tolist()}")
+
+        mask_bool = mask.bool()
+
+        # Junction embeddings + psi
+        F = self.feature_embedding                                 # (J, D)
+        x_exp = x.unsqueeze(-1)                                    # (B, J, 1)
+        F_exp = F.unsqueeze(0).expand(B, J, D)                     # (B, J, D)
+
+        # --- ATSE embeddings per junction ---
+        if self.atse_embedding is None:
+            raise RuntimeError(
+                "ATSE embeddings not initialized. "
+                "Call `register_junc2atse(...)` before using this encoder."
+            )
+
+        idx_p, idx_g = self.junc2atse.indices()
+        idx_p = idx_p.to(device)
+        idx_g = idx_g.to(device)
+
+        # Map each junction → its ATSE index
+        atse_idx = torch.full((J,), 0, dtype=torch.long, device=device)
+        atse_idx[idx_p] = idx_g
+
+        # Lookup ATSE embeddings and prepare it to attach to the cells
+        atse_emb = self.atse_embedding[atse_idx]               # (J, Ae)
+        atse_emb_exp = atse_emb.unsqueeze(0).expand(B, J, -1)  # (B, J, Ae)
+
+        # h-layer input
+        h_in = torch.cat([x_exp, F_exp, atse_emb_exp], dim=-1)     # (B, J, 1 + D + Ae)
+        h_out = self.h_layer(h_in.view(B * J, -1)).view(B, J, D)
+
+        # Mask + pool
+        masked_h = h_out * mask_bool.unsqueeze(-1)
+        pooled = masked_h.sum(dim=1)
+
+        if self.pool_mode == "mean":
+            denom = mask_bool.sum(dim=1, keepdim=True).clamp(min=1)
+            c = pooled / denom
+        else:
+            c = pooled
+
+        # Encoder MLP
+        mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
+
+
+
+class PartialEncoderWeightedSumEDDIMultiWeightFast(nn.Module):
+    """
+    Fast multi-head weighted-sum EDDI encoder (batched).
+    Changes vs. PartialEncoderWeightedSumEDDIMultiWeight:
+      - Processes all junctions at once (no per-cell loop).
+      - Mask unobserved junctions by:
+         (i) setting gate logits to -inf before softmax (so weights=0),
+         (ii) masking h_out in the weighted sum.
+      - Softmax is taken along the junction axis dim=1 (J).
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        code_dim: int,
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        num_weight_vectors: int = 4,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        temperature_value: float = 1.0,
+        temperature_fixed: bool = True,
+    ):
+        super().__init__()
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        self.code_dim = code_dim
+        self.num_weight_vectors = num_weight_vectors
+        self.temperature_value = float(temperature_value)
+        self.temperature_fixed = temperature_fixed
+
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, self.code_dim))
+
+        in_dim = 1 + self.code_dim
+        self.h_layer = nn.Sequential(
+            nn.Linear(in_dim, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(h_hidden_dim, self.code_dim),
+            nn.LayerNorm(self.code_dim),
+            nn.ReLU(),
+        )
+
+        self.gate_net = nn.Sequential(
+            nn.Linear(self.code_dim, self.code_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.code_dim // 2, self.num_weight_vectors),
+        )
+
+        if self.num_weight_vectors == 1:
+            self.combiner = nn.Identity()
+        else:
+            self.combiner = nn.Sequential(
+                nn.Linear(self.num_weight_vectors * self.code_dim, self.code_dim),
+                nn.LayerNorm(self.code_dim),
+                nn.ReLU(),
+            )
+
+        self.encoder_mlp = FCLayers(
+            n_in=self.code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=n_cat_list or [],
+            n_cont=n_cont,
+            n_layers=2,
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,            # (B, J)
+        mask: torch.Tensor,         # (B, J)
+        *cat_list: torch.Tensor,
+        cont: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, J = x.shape
+        D = self.code_dim
+        W = self.num_weight_vectors
+        device = x.device
+
+        # inside forward(), right after you unpack (B, J)
+        if (mask.sum(dim=1) == 0).any():
+            bad_idx = (mask.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+            print(f"[Warning] Found {bad_idx.numel()} cells in batch with 0 observed junctions: {bad_idx.tolist()}")
+
+        mask_bool = mask.bool()                             # (B, J)
+        F = self.feature_embedding                          # (J, D)
+        x_exp = x.unsqueeze(-1)                             # (B, J, 1)
+        F_exp = F.unsqueeze(0).expand(B, J, D)              # (B, J, D)
+
+        h_in = torch.cat([x_exp, F_exp], dim=-1)            # (B, J, 1+D)
+        h_out = self.h_layer(h_in.view(B * J, -1)).view(B, J, D)  # (B, J, D)
+
+        # Gate scores per junction
+        raw_gates = self.gate_net(h_out)                    # (B, J, W)
+
+        # Neighbor scaling (per cell if not fixed)
+        if self.temperature_fixed:
+            scale = self.temperature_value
+            logits = raw_gates * scale                      # (B, J, W)
+        else:
+            n_obs = mask_bool.sum(dim=1).clamp(min=1)       # (B,)
+            scale = (n_obs.float()).rsqrt().view(B, 1, 1)   # (B,1,1)
+            logits = raw_gates * scale                      # (B, J, W)
+
+        # Mask unobserved junctions in logits → -inf so softmax gives 0
+        logits = logits.masked_fill(~mask_bool.unsqueeze(-1), float(-1e9))  # (B, J, W)
+
+        # Softmax over junction axis
+        weights = torch.softmax(logits, dim=1)              # (B, J, W)
+
+        # Also mask h_out so unobserved contribute nothing
+        h_masked = h_out * mask_bool.unsqueeze(-1)          # (B, J, D)
+
+        # Weighted sums per head: (B, W, D)
+        head_sums = (weights.transpose(1, 2).unsqueeze(-1) * h_masked.unsqueeze(1)).sum(dim=2)
+
+        if W == 1:
+            combined = head_sums.squeeze(1)                 # (B, D)
+        else:
+            combined = self.combiner(head_sums.reshape(B, W * D))  # (B, D)
+
+        mu_logvar = self.encoder_mlp(combined, *cat_list, cont=cont)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
+
+
+import torch
+import torch.nn as nn
+from typing import Iterable, Literal
+from scvi.nn import FCLayers
+
+class PartialEncoderWeightedSumEDDIMultiWeightATSEFast(nn.Module):
+    """
+    Fast multi-head weighted-sum EDDI + ATSE encoder (batched), using per-ATSE embeddings.
+
+    - Per-junction embeddings: (J, D)
+    - Per-ATSE embeddings: (A, Ae) as a trainable nn.Parameter, created in register_junc2atse
+    - Gate input uses concatenation [h_out_d, atse_emb_d] with fixed Ae (no gate rebuild).
+    - ATSE indices are derived from self.junc2atse (sparse J x A) on the fly.
+    """
+    def __init__(
+        self,
+        input_dim: int,           # J
+        code_dim: int,            # D
+        h_hidden_dim: int,
+        encoder_hidden_dim: int,
+        latent_dim: int,
+        num_weight_vectors: int = 4,
+        dropout_rate: float = 0.0,
+        n_cat_list: Iterable[int] | None = None,
+        n_cont: int = 0,
+        inject_covariates: bool = True,
+        temperature_value: float = 1.0,
+        temperature_fixed: bool = True,
+        atse_embedding_dimension: int = 16,   # known at init → no gate rebuild later
+    ):
+        super().__init__()
+        self.code_dim = code_dim
+        self.num_weight_vectors = num_weight_vectors
+        self.temperature_value = float(temperature_value)
+        self.temperature_fixed = temperature_fixed
+        self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
+        self.n_cont = n_cont
+        self.inject_covariates = inject_covariates
+        self.atse_embedding_dimension = int(atse_embedding_dimension)
+
+        # (J, D) per-junction embeddings
+        self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
+
+        # h-layer: input [psi (1) + junction-embedding (D)] -> D
+        in_dim_h = 1 + code_dim
+        self.h_layer = nn.Sequential(
+            nn.Linear(in_dim_h, h_hidden_dim),
+            nn.LayerNorm(h_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(h_hidden_dim, code_dim),
+            nn.LayerNorm(code_dim),
+            nn.ReLU(),
+        )
+
+        # Gate network: input is [h_out (D) + ATSE emb (Ae)] — Ae known at init.
+        in_dim_gate = code_dim + self.atse_embedding_dimension
+        self.gate_net = nn.Sequential(
+            nn.Linear(in_dim_gate, max(in_dim_gate // 2, 1)),
+            nn.ReLU(),
+            nn.Linear(max(in_dim_gate // 2, 1), self.num_weight_vectors),
+        )
+
+        # Combine W head vectors → (B, D)
+        if self.num_weight_vectors == 1:
+            self.combiner = nn.Identity()
+        else:
+            self.combiner = nn.Sequential(
+                nn.Linear(self.num_weight_vectors * self.code_dim, self.code_dim),
+                nn.LayerNorm(self.code_dim),
+                nn.ReLU(),
+            )
+
+        # Final encoder MLP → (mu, logvar)
+        self.encoder_mlp = FCLayers(
+            n_in=code_dim,
+            n_out=2 * latent_dim,
+            n_cat_list=n_cat_list or [],
+            n_cont=n_cont,
+            n_layers=2,
+            n_hidden=encoder_hidden_dim,
+            dropout_rate=dropout_rate,
+            use_batch_norm=False,
+            use_layer_norm=True,
+            inject_covariates=inject_covariates,
+        )
+
+        # Sparse mapping rows=junctions (J), cols=ATSEs (A)
+        self.register_buffer("junc2atse", torch.sparse_coo_tensor(size=(input_dim, 0)))
+        self.n_atse = 0
+
+        # Per-ATSE embedding table (A, Ae), created when we learn A via register_junc2atse()
+        self.atse_embedding: nn.Parameter | None = None
+
+    @torch.no_grad()
+    def register_junc2atse(self, junc2atse: torch.sparse.Tensor):
+        """
+        Provide the (J x A) sparse mapping (exactly one nonzero per junction).
+        Creates the ATSE embedding Parameter (A, Ae) on the same device as feature_embedding.
+        """
+        j2a = junc2atse.coalesce().to(self.feature_embedding.device)
+        self.register_buffer("junc2atse", j2a)
+
+        # Count #ATSEs
+        _, atse_idx = j2a.indices()
+        self.n_atse = int(atse_idx.max().item()) + 1 if atse_idx.numel() > 0 else 0
+
+        if self.n_atse == 0:
+            self.atse_embedding = None
+        else:
+            # Create ATSE embeddings (A, Ae) on same device
+            self.atse_embedding = nn.Parameter(
+                torch.randn(self.n_atse, self.atse_embedding_dimension, device=j2a.device)
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,        # (B, J)
+        mask: torch.Tensor,     # (B, J)
+        *cat_list: torch.Tensor,
+        cont: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, J = x.shape
+        D = self.code_dim
+        W = self.num_weight_vectors
+        device = x.device
+
+        if (mask.sum(dim=1) == 0).any():
+            bad = (mask.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+            print(f"[Warning] Found {bad.numel()} cells in batch with 0 observed junctions: {bad.tolist()}")
+
+        if self.atse_embedding is None or self.n_atse == 0:
+            raise RuntimeError(
+                "ATSE embeddings not initialized. Call `register_junc2atse(...)` before using this encoder."
+            )
+
+        mask_bool = mask.bool()                          # (B, J)
+        F = self.feature_embedding                       # (J, D)
+
+        # ensure ATSE table is on the same device as F (matches your other models' pattern)
+        atse_table = self.atse_embedding
+        if atse_table.device != F.device:
+            atse_table = atse_table.to(F.device)
+
+        # h-layer inputs
+        x_exp = x.unsqueeze(-1)                          # (B, J, 1)
+        F_exp = F.unsqueeze(0).expand(B, J, D)           # (B, J, D)
+        h_in  = torch.cat([x_exp, F_exp], dim=-1)        # (B, J, 1+D)
+        h_out = self.h_layer(h_in.view(B * J, -1)).view(B, J, D)
+
+        # Build per-junction ATSE indices from sparse mapping
+        idx_p, idx_g = self.junc2atse.indices()
+        idx_p = idx_p.to(F.device)
+        idx_g = idx_g.to(F.device)
+        atse_idx = torch.full((J,), 0, dtype=torch.long, device=F.device)
+        atse_idx[idx_p] = idx_g                           # (J,)
+
+        # Gather ATSE embeddings and broadcast to batch
+        atse_emb = atse_table[atse_idx]                   # (J, Ae)
+        atse_emb_exp = atse_emb.unsqueeze(0).expand(B, J, -1)  # (B, J, Ae)
+
+        # Gate input: concat per-junction code with ATSE embedding
+        gate_in = torch.cat([h_out, atse_emb_exp], dim=-1)      # (B, J, D+Ae)
+        raw_gates = self.gate_net(gate_in)                      # (B, J, W)
+
+        # Temperature / neighbor scaling
+        if self.temperature_fixed:
+            logits = raw_gates * self.temperature_value
+        else:
+            n_obs = mask_bool.sum(dim=1).clamp(min=1)           # (B,)
+            scale = (n_obs.float()).rsqrt().view(B, 1, 1)
+            logits = raw_gates * scale
+
+        # Mask unobserved junctions in logits → softmax zero weight
+        logits = logits.masked_fill(~mask_bool.unsqueeze(-1), float(-1e9))  # (B, J, W)
+        weights = torch.softmax(logits, dim=1)                               # (B, J, W)
+
+        # Also mask h_out
+        h_masked = h_out * mask_bool.unsqueeze(-1)            # (B, J, D)
+
+        # Weighted sums per head: (B, W, D)
+        head_sums = (weights.transpose(1, 2).unsqueeze(-1) * h_masked.unsqueeze(1)).sum(dim=2)
+
+        # Combine heads
+        if W == 1:
+            combined = head_sums.squeeze(1)                   # (B, D)
+        else:
+            combined = self.combiner(head_sums.reshape(B, W * D))  # (B, D)
+
+        # Final projection → mu, logvar
+        mu_logvar = self.encoder_mlp(combined, *cat_list, cont=cont)  # (B, 2Z)
+        mu, logvar = mu_logvar.chunk(2, dim=-1)
+        return mu, logvar
+
+
 
 class LinearDecoder(nn.Module):
     def __init__(
@@ -905,7 +1504,7 @@ class PARTIALVAE(BaseModuleClass):
         ] = "PartialEncoderEDDI",
         pool_mode: Literal["mean","sum"] = "mean",
         num_weight_vectors: int = 4,
-        temperature_value: float = 1.0, #if temperature_value is set to -1, then the median number of observations is used as the fixed temperature value.
+        temperature_value: float = -1.0, #if temperature_value is set to -1, then the median number of observations is used as the fixed temperature value.
         temperature_fixed: bool = True, #if temperature is fixed, it is fixed to the value of temperature_value
     ):
         super().__init__()
@@ -944,8 +1543,8 @@ class PARTIALVAE(BaseModuleClass):
 
         # instantiate the requested encoder
         if encoder_type == "PartialEncoderEDDI":
-            print(f"Using EDDI Partial Encoder")
-            self.encoder = PartialEncoderEDDI(
+            print(f"Using EDDI Partial Encoder+Fast")
+            self.encoder = PartialEncoderEDDIFast(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
@@ -959,8 +1558,8 @@ class PARTIALVAE(BaseModuleClass):
             )
 
         elif encoder_type == "PartialEncoderEDDIATSE":
-            print("Using EDDI + ATSE Partial Encoder")
-            self.encoder = PartialEncoderEDDIATSE(
+            print("Using EDDI + ATSE Partial Encoder+Fast")
+            self.encoder = PartialEncoderEDDIATSEFast(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
@@ -974,8 +1573,8 @@ class PARTIALVAE(BaseModuleClass):
             )
         
         elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
-            print("Using PartialEncoderWeightedSumEDDIMultiWeight")
-            self.encoder = PartialEncoderWeightedSumEDDIMultiWeight(
+            print("Using PartialEncoderWeightedSumEDDIMultiWeigh+Fast")
+            self.encoder = PartialEncoderWeightedSumEDDIMultiWeightFast(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
@@ -991,8 +1590,8 @@ class PARTIALVAE(BaseModuleClass):
             )
 
         elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
-            print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE")
-            self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSE(
+            print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE+Fast")
+            self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSEFast(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,

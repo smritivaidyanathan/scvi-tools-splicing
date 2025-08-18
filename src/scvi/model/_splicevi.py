@@ -95,6 +95,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         ] = "PartialEncoderEDDI",
         pool_mode: Literal["mean","sum"]="mean",
         num_weight_vectors: int = 4,
+        temperature_value: float = 1.0, #if temperature_value is set to -1, then the median number of observations is used as the fixed temperature value.
+        temperature_fixed: bool = False, #if temperature is fixed, it is fixed to the value of temperature_value
         **kwargs,
     ):
         super().__init__(adata)
@@ -115,6 +117,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             encoder_type = encoder_type,
             pool_mode=pool_mode,
             num_weight_vectors = num_weight_vectors,
+            temperature_value=temperature_value,
+            temperature_fixed=temperature_fixed,
             **kwargs,
         )
 
@@ -129,7 +133,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             f"encode_covariates={encode_covariates}, "
             f"deeply_inject_covariates={deeply_inject_covariates}, "
             f"initialize_embeddings_from_pca={initialize_embeddings_from_pca}, "
-            f"encoder_type={encoder_type}, num_weight_vectors={num_weight_vectors}, pool_mode={pool_mode}."
+            f"encoder_type={encoder_type}, num_weight_vectors={num_weight_vectors}, temperature_value={temperature_value}, temperature_fixed={temperature_fixed}, pool_mode={pool_mode}."
         )
 
 
@@ -174,7 +178,9 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                         print("Registering junc2ATSE")
                         self.module.encoder.register_junc2atse(self.module.junc2atse)
                     if "multi" in encoder_type.lower():
-                        if self.module.encoder.temperature_fixed < 0.0:
+                        print("Multi in encoder type")
+                        if self.module.encoder.temperature_value < 0.0:
+                            print("Resetting temperature value.")
                             self.set_median_obs_temperature()
                             
                 self.module.num_junctions=len(self.adata.var)
@@ -184,16 +190,18 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
 
 
     def set_median_obs_temperature(self):
-        mask = self.adata.layers["psi_mask"]
-        if sp.issparse(mask):
-            # Sum over columns per row; yields a (B, 1) matrix
-            counts = np.asarray(mask.sum(axis=1)).ravel()
+        M = self.adata.layers["psi_mask"]
+        if sp.issparse(M):
+            # per-row nonzeros, memory-light
+            counts = M.tocsr().getnnz(axis=1)
             median_obs = np.median(counts)
         else:
-            mask = self.adata.layers["psi_mask"]           # shape (B, J), 0/1 or bool
-            median_obs = np.median((mask > 0).sum(axis=1)) # per-cell count → median
-        print(f"Resetting temperature_fixed to be 1/sqrt of number of observed junctions. median(n_obs) = {median_obs}")
-        self.module.encoder.temperature_fixed =  1.0 / max(np.sqrt(median_obs), 1.0)
+            # works for bool or 0/1 dense
+            median_obs = np.median(np.count_nonzero(M, axis=1))
+
+        T = 1.0 / max(np.sqrt(float(median_obs)), 1.0)
+        print(f"Resetting temperature_value to 1/sqrt(median n_obs). median(n_obs)={median_obs}, T={T:.6f}")
+        self.module.encoder.temperature_value= T  # python float is fine
         
     def make_junc2atse(self, atse_labels):
         print("Making Junc2Atse...")
