@@ -95,8 +95,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         ] = "PartialEncoderEDDI",
         pool_mode: Literal["mean","sum"]="mean",
         num_weight_vectors: int = 4,
-        temperature_value: float = 1.0, #if temperature_value is set to -1, then the median number of observations is used as the fixed temperature value.
-        temperature_fixed: bool = False, #if temperature is fixed, it is fixed to the value of temperature_value
+        temperature_value: float = -1.0, #if temperature_value is set to -1, then the median number of observations is used as the fixed temperature value.
+        temperature_fixed: bool = True, #if temperature is fixed, it is fixed to the value of temperature_value
         **kwargs,
     ):
         super().__init__(adata)

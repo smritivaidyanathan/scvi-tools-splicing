@@ -346,12 +346,20 @@ import torch.nn.functional as F
 from scvi.nn import FCLayers
 from typing import Iterable, Literal
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Iterable, Literal
+from scvi.nn import FCLayers
+
 class PartialEncoderEDDIATSE(nn.Module):
     """
-    EDDI Partial Encoder with ATSE one-hot features kept in sparse form.
-    After calling `register_junc2atse`, the sparse junc2atse buffer is set and
-    the h_layer is rebuilt to include the ATSE one-hot dimension.
-    Includes a sanity-print on the first observed junction of each batch.
+    EDDI Partial Encoder with learnable ATSE embeddings (no one-hot).
+
+    - Per-junction embedding: (J, D)
+    - Per-ATSE embedding table: (A, Ae) created in `register_junc2atse`
+    - h_layer sees [psi (1) | junction_embed (D) | atse_embed (Ae)]
+    - Per-cell Python loop preserved.
     """
     def __init__(
         self,
@@ -365,6 +373,7 @@ class PartialEncoderEDDIATSE(nn.Module):
         n_cont: int = 0,
         inject_covariates: bool = True,
         pool_mode: Literal["mean","sum"] = "mean",
+        atse_embedding_dimension: int = 16,
     ):
         super().__init__()
         self.code_dim = code_dim
@@ -374,14 +383,15 @@ class PartialEncoderEDDIATSE(nn.Module):
         self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
         self.n_cont = n_cont
         self.inject_covariates = inject_covariates
+        self.atse_embedding_dimension = int(atse_embedding_dimension)
 
-        # per-junction embeddings
+        # Per-junction embeddings
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
 
-        # placeholder h_layer until ATSE info arrives (n_atse=0)
-        self.h_layer = self._make_h_layer(n_atse=0)
+        # Placeholder h_layer; rebuilt after register_junc2atse() to include Ae
+        self.h_layer = self._make_h_layer(n_atse_embed=0)
 
-        # encoder MLP (handles covariates internally)
+        # Encoder MLP (handles covariates internally)
         self.encoder_mlp = FCLayers(
             n_in=code_dim,
             n_out=2 * latent_dim,
@@ -395,13 +405,16 @@ class PartialEncoderEDDIATSE(nn.Module):
             inject_covariates=inject_covariates,
         )
 
-        # sparse buffer for junc2atse (rows=junctions, cols=ATSEs)
+        # Sparse mapping rows=junctions (J), cols=ATSEs (A)
         self.register_buffer("junc2atse", torch.sparse_coo_tensor(size=(input_dim, 0)))
+        self.register_buffer("atse_index_per_j", torch.empty(0, dtype=torch.long))
         self.n_atse = 0
 
-    def _make_h_layer(self, n_atse: int) -> nn.Sequential:
-        # input dim = [psi scalar] + [feature embedding] + [ATSE one-hot of size n_atse]
-        in_dim = 1 + self.code_dim + n_atse
+        # Will be created in register_junc2atse
+        self.atse_embedding: nn.Parameter | None = None
+
+    def _make_h_layer(self, n_atse_embed: int) -> nn.Sequential:
+        in_dim = 1 + self.code_dim + n_atse_embed
         return nn.Sequential(
             nn.Linear(in_dim, self.h_hidden_dim),
             nn.LayerNorm(self.h_hidden_dim),
@@ -415,64 +428,79 @@ class PartialEncoderEDDIATSE(nn.Module):
     @torch.no_grad()
     def register_junc2atse(self, junc2atse: torch.sparse.Tensor):
         """
-        Must be called once after the sparse junc2atse is built.
-        Sets the buffer and rebuilds h_layer to accept the correct ATSE dimension.
+        Provide the (J x A) sparse mapping (one nonzero per junction).
+        Builds ATSE embedding table (A, Ae) and rebuilds h_layer to accept Ae dims.
+        Also precomputes a dense index vector mapping each junction→ATSE id.
         """
         j2a = junc2atse.coalesce().to(self.feature_embedding.device)
         self.register_buffer("junc2atse", j2a)
-        # determine number of ATSE groups
+
+        # Count ATSEs
         _, idx_g = j2a.indices()
-        self.n_atse = int(idx_g.max().item()) + 1
-        # rebuild h_layer with new ATSE one-hot size
-        print(f"Rebuilding H Layer with new ATSE one hot size = {self.n_atse} ATSEs.")
-        self.h_layer = self._make_h_layer(n_atse=self.n_atse)
+        self.n_atse = int(idx_g.max().item()) + 1 if idx_g.numel() > 0 else 0
+
+        # Create (or clear) ATSE embeddings
+        if self.n_atse == 0:
+            self.atse_embedding = None
+            self.register_buffer("atse_index_per_j", torch.zeros(self.feature_embedding.shape[0], dtype=torch.long, device=j2a.device))
+            self.h_layer = self._make_h_layer(n_atse_embed=0)
+        else:
+            self.atse_embedding = nn.Parameter(
+                torch.randn(self.n_atse, self.atse_embedding_dimension, device=j2a.device)
+            )
+            # Build a dense junction→ATSE lookup (size J)
+            J = self.feature_embedding.shape[0]
+            idx_p, idx_g = j2a.indices()
+            atse_idx = torch.zeros(J, dtype=torch.long, device=j2a.device)
+            atse_idx[idx_p] = idx_g
+            self.register_buffer("atse_index_per_j", atse_idx)
+            # Now h_layer expects Ae inputs
+            self.h_layer = self._make_h_layer(n_atse_embed=self.atse_embedding_dimension)
 
     def forward(
         self,
-        x: torch.Tensor,       # (B, D)
-        mask: torch.Tensor,    # (B, D)
+        x: torch.Tensor,       # (B, J)
+        mask: torch.Tensor,    # (B, J)
         *cat_list: torch.Tensor,
         cont: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, D = x.shape
+        if self.atse_embedding is None:
+            raise RuntimeError("ATSE embeddings not initialized. Call `register_junc2atse(...)` first.")
+
+        B, J = x.shape
+        D = self.code_dim
+        device = x.device
         outputs = []
+
         for b in range(B):
-            # get observed indices
             obs_idx = torch.where(mask[b].bool())[0]  # (n_obs,)
-            # slice psi and embeddings
-            x_obs = x[b, obs_idx]                     # (n_obs,)
-            F_obs = self.feature_embedding[obs_idx]   # (n_obs, code_dim)
+            if obs_idx.numel() == 0:
+                outputs.append(torch.zeros(D, device=device))
+                continue
 
-            # slice sparse rows and convert to dense one-hot
-            atse_sparse = self.junc2atse.index_select(0, obs_idx)  # sparse (n_obs, n_atse)
-            atse_oh = atse_sparse.to_dense()                      # (n_obs, n_atse)
+            x_obs = x[b, obs_idx]                           # (n_obs,)
+            F_obs = self.feature_embedding[obs_idx]         # (n_obs, D)
 
-            # sanity check on first observed junction
-            if b == 0 and obs_idx.numel() > 0:
-                j0 = obs_idx[0].item()
-                oh0 = atse_oh[0]
-                idx0 = torch.argmax(oh0).item()
-                # lookup true sparse mapping
-                idx_p, idx_g = self.junc2atse.coalesce().indices()
-                true_idx = idx_g[(idx_p == j0).nonzero(as_tuple=True)[0][0]].item()
-                print(f"[Sanity] junction {j0}: one-hot idx {idx0}, sparse mapping {true_idx}")
+            # ATSE embedding for each observed junction
+            atse_ids = self.atse_index_per_j[obs_idx]       # (n_obs,)
+            Ae_obs   = self.atse_embedding[atse_ids]        # (n_obs, Ae)
 
-            # build h_input and apply h_layer
-            h_in  = torch.cat([x_obs.unsqueeze(-1), F_obs, atse_oh], dim=1)
-            h_out = self.h_layer(h_in)                # (n_obs, code_dim)
+            h_in  = torch.cat([x_obs.unsqueeze(-1), F_obs, Ae_obs], dim=1)  # (n_obs, 1+D+Ae)
+            h_out = self.h_layer(h_in)                       # (n_obs, D)
 
-            # pool
             summed = h_out.sum(dim=0)
             if self.pool_mode == "mean":
-                c = summed / obs_idx.numel().clamp(min=1)
+                c = summed / obs_idx.numel()
             else:
                 c = summed
             outputs.append(c)
 
-        c = torch.stack(outputs, dim=0)  # (B, code_dim)
+        c = torch.stack(outputs, dim=0)  # (B, D)
+
         mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
         mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
+
 
 import torch
 import torch.nn.functional as F
@@ -481,12 +509,27 @@ from typing import Iterable, Literal
 from scvi.nn import FCLayers
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Iterable
+from scvi.nn import FCLayers
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Iterable
+from scvi.nn import FCLayers
+
 class PartialEncoderWeightedSumEDDIMultiWeightATSE(nn.Module):
     """
-    EDDI-style encoder with multi-head weighted sum, augmented with ATSE one-hot features in the gate network.
+    EDDI-style multi-head weighted-sum encoder with learnable ATSE embeddings.
 
-    After calling `register_junc2atse`, the sparse mapping is stored, and the gate network
-    is rebuilt to accept [per-junction code_dim] + [num_ATSEs] inputs.
+    - Per-junction embedding: (J, D)
+    - Per-ATSE embedding table: (A, Ae) created in `register_junc2atse`
+    - h_layer computes per-junction codes from [psi | junction_embed]
+    - Gate sees [h_out (D) | atse_embed (Ae)]  (Ae known at init → no gate rebuild)
+    - Per-cell Python loop preserved.
     """
     def __init__(
         self,
@@ -500,25 +543,27 @@ class PartialEncoderWeightedSumEDDIMultiWeightATSE(nn.Module):
         n_cat_list: Iterable[int] | None = None,
         n_cont: int = 0,
         inject_covariates: bool = True,
-        temperature_value: float = 1,
-        temperature_fixed: bool = True, #if temperature is fixed, it is fixed to the value of temperature_value
+        temperature_value: float = 1.0,
+        temperature_fixed: bool = True,
+        atse_embedding_dimension: int = 16,
     ):
         super().__init__()
         self.code_dim = code_dim
         self.num_weight_vectors = num_weight_vectors
-        self.temperature_value = temperature_value
-        self.temperature_fixed = temperature_fixed
+        self.temperature_value = float(temperature_value)
+        self.temperature_fixed = bool(temperature_fixed)
         self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
         self.n_cont = n_cont
         self.inject_covariates = inject_covariates
+        self.atse_embedding_dimension = int(atse_embedding_dimension)
 
-        # per-junction embeddings
+        # Per-junction embeddings (J, D)
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
 
-        # shared h-layer computes per-junction codes
-        in_dim = 1 + code_dim
+        # h-layer: [psi (1) + junction-embedding (D)] -> D
+        in_dim_h = 1 + code_dim
         self.h_layer = nn.Sequential(
-            nn.Linear(in_dim, h_hidden_dim),
+            nn.Linear(in_dim_h, h_hidden_dim),
             nn.LayerNorm(h_hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
@@ -527,14 +572,16 @@ class PartialEncoderWeightedSumEDDIMultiWeightATSE(nn.Module):
             nn.ReLU(),
         )
 
-        # initial gate net takes only code_dim; will be rebuilt after register_junc2atse
+        # Gate net: input is [h_out (D) + ATSE emb (Ae)] — Ae is fixed by ctor, so no rebuild
+        in_dim_gate = code_dim + self.atse_embedding_dimension
+        hidden_gate = max(in_dim_gate // 2, 1)
         self.gate_net = nn.Sequential(
-            nn.Linear(code_dim, code_dim // 2),
+            nn.Linear(in_dim_gate, hidden_gate),
             nn.ReLU(),
-            nn.Linear(code_dim // 2, self.num_weight_vectors),
+            nn.Linear(hidden_gate, self.num_weight_vectors),
         )
 
-        # combiner: (W * D) -> D
+        # Combiner: (W * D) -> D
         if self.num_weight_vectors == 1:
             self.combiner = nn.Identity()
         else:
@@ -544,7 +591,7 @@ class PartialEncoderWeightedSumEDDIMultiWeightATSE(nn.Module):
                 nn.ReLU(),
             )
 
-        # final encoder MLP
+        # Final encoder MLP
         self.encoder_mlp = FCLayers(
             n_in=code_dim,
             n_out=2 * latent_dim,
@@ -558,87 +605,108 @@ class PartialEncoderWeightedSumEDDIMultiWeightATSE(nn.Module):
             inject_covariates=inject_covariates,
         )
 
-        # buffers for ATSE mapping
+        # Sparse mapping J×A and dense junction→ATSE index
         self.register_buffer("junc2atse", torch.sparse_coo_tensor(size=(input_dim, 0)))
-        self.register_buffer("j2a_t", torch.sparse_coo_tensor(size=(0, input_dim)))
+        self.register_buffer("atse_index_per_j", torch.empty(0, dtype=torch.long))
         self.n_atse = 0
+
+        # ATSE embeddings created in register_junc2atse
+        self.atse_embedding: nn.Parameter | None = None
 
     @torch.no_grad()
     def register_junc2atse(self, junc2atse: torch.sparse.Tensor):
-        # Store and coalesce mapping
+        """
+        Provide (J x A) sparse mapping (one nonzero per junction).
+        Creates ATSE embedding table (A, Ae) and a dense junction→ATSE index.
+        """
         j2a = junc2atse.coalesce().to(self.feature_embedding.device)
         self.register_buffer("junc2atse", j2a)
-        # Transpose for pooling
-        self.register_buffer("j2a_t", j2a.transpose(0, 1).coalesce())
-        # Determine number of ATSEs
-        _, atse_idx = j2a.indices()
-        self.n_atse = int(atse_idx.max().item()) + 1
-        # Rebuild gate network to accept code_dim + n_atse inputs
-        in_dim = self.code_dim + self.n_atse
-        self.gate_net = nn.Sequential(
-            nn.Linear(in_dim, in_dim // 2),
-            nn.ReLU(),
-            nn.Linear(in_dim // 2, self.num_weight_vectors),
-        )
+
+        _, idx_g = j2a.indices()
+        self.n_atse = int(idx_g.max().item()) + 1 if idx_g.numel() > 0 else 0
+
+        J = self.feature_embedding.shape[0]
+        if self.n_atse == 0:
+            self.atse_embedding = None
+            self.register_buffer("atse_index_per_j", torch.zeros(J, dtype=torch.long, device=j2a.device))
+        else:
+            # ATSE embedding table (A, Ae)
+            self.atse_embedding = nn.Parameter(
+                torch.randn(self.n_atse, self.atse_embedding_dimension, device=j2a.device)
+            )
+            # Dense junction→ATSE lookup
+            idx_p, idx_g = j2a.indices()
+            atse_idx = torch.zeros(J, dtype=torch.long, device=j2a.device)
+            atse_idx[idx_p] = idx_g
+            self.register_buffer("atse_index_per_j", atse_idx)
 
     def forward(
         self,
-        x: torch.Tensor,   # (B, J)
-        mask: torch.Tensor, # (B, J)
-        *cat_list,
+        x: torch.Tensor,            # (B, J)
+        mask: torch.Tensor,         # (B, J) 1=observed, 0=missing
+        *cat_list: torch.Tensor,
         cont: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.atse_embedding is None:
+            raise RuntimeError("ATSE embeddings not initialized. Call `register_junc2atse(...)` first.")
+
         B, J = x.shape
+        D = self.code_dim
+        W = self.num_weight_vectors
         device = x.device
+
         outputs = []
 
+        # Optional warning for empty cells
+        if (mask.sum(dim=1) == 0).any():
+            bad = (mask.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+            print(f"[Warning] Found {bad.numel()} cells in batch with 0 observed junctions: {bad.tolist()}")
+
         for b in range(B):
-            # select observed junctions
-            obs_idx = mask[b].bool()
-            n_obs = obs_idx.sum().item()
+            obs_idx = mask[b].bool().nonzero(as_tuple=True)[0]  # (n_obs,)
+            n_obs = obs_idx.numel()
             if n_obs == 0:
-                outputs.append(torch.zeros(self.code_dim, device=device))
+                outputs.append(torch.zeros(D, device=device))
                 continue
 
-            # slice values and embeddings
-            x_obs = x[b, obs_idx]
-            F_obs = self.feature_embedding[obs_idx]
-            # compute per-junction codes
-            h_in = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)
-            h_out = self.h_layer(h_in)  # (n_obs, D)
+            # Per-junction code
+            x_obs = x[b, obs_idx]                    # (n_obs,)
+            F_obs = self.feature_embedding[obs_idx]  # (n_obs, D)
+            h_in  = torch.cat([x_obs.unsqueeze(-1), F_obs], dim=1)  # (n_obs, 1+D)
+            h_out = self.h_layer(h_in)               # (n_obs, D)
 
-            # prepare ATSE one-hot
-            atse_sparse = self.junc2atse.index_select(0, obs_idx.nonzero(as_tuple=True)[0])
-            atse_oh = atse_sparse.to_dense().to(device)  # (n_obs, A)
+            # Gate input with ATSE embedding
+            atse_ids = self.atse_index_per_j[obs_idx]           # (n_obs,)
+            Ae_obs   = self.atse_embedding[atse_ids]            # (n_obs, Ae)
+            gate_in  = torch.cat([h_out, Ae_obs], dim=1)        # (n_obs, D+Ae)
+            raw_gates = self.gate_net(gate_in)                   # (n_obs, W)
 
-            # temperature from mean code
-            mean_h = h_out.mean(dim=0)
-            
-
-            # gate inputs include code + ATSE one-hot
-            gate_in = torch.cat([h_out, atse_oh], dim=1)
-            raw_gates = self.gate_net(gate_in)  # (n_obs, W)
-
-            # neighbor scaling
+            # Temperature / neighbor scaling
             if self.temperature_fixed:
-                neighbor_scale = self.temperature_value
+                logits = raw_gates * self.temperature_value
             else:
-                neighbor_scale = 1.0 / torch.sqrt(torch.tensor(n_obs, device=device).float().clamp(min=1.0))
-            logits = (raw_gates * neighbor_scale) 
-            logits = logits.clamp(min=-10.0, max=10.0)
+                scale = (float(n_obs)) ** -0.5
+                logits = raw_gates * scale
 
-            # normalize over junctions
-            weights = torch.softmax(logits, dim=0)  # (n_obs, W)
+            logits = logits.clamp(min=-10.0, max=10.0)          # numerical hygiene
 
-            # head-wise weighted sums
-            head_sums = (weights.transpose(0, 1).unsqueeze(-1) * h_out.unsqueeze(0)).sum(dim=1)
+            # Normalize over junctions (softmax along dim=0)
+            weights = torch.softmax(logits, dim=0)              # (n_obs, W)
+
+            # Weighted sums per head: (W, D)
+            head_sums = (weights.T.unsqueeze(-1) * h_out.unsqueeze(0)).sum(dim=1)
+
+            # Combine heads → (D,)
             combined = self.combiner(head_sums.reshape(-1))
             outputs.append(combined)
 
-        c = torch.stack(outputs, dim=0)
+        c = torch.stack(outputs, dim=0)  # (B, D)
+
         mu_logvar = self.encoder_mlp(c, *cat_list, cont=cont)
         mu, logvar = mu_logvar.chunk(2, dim=-1)
         return mu, logvar
+
+
 
 
 
@@ -1540,11 +1608,12 @@ class PARTIALVAE(BaseModuleClass):
         # Instantiate encoder + decoder, passing covariate specs
 
         print(f"Using code_dim={code_dim}!")
+        print(f"Using latent_dim={n_latent}")
 
         # instantiate the requested encoder
         if encoder_type == "PartialEncoderEDDI":
-            print(f"Using EDDI Partial Encoder+Fast")
-            self.encoder = PartialEncoderEDDIFast(
+            print(f"Using EDDI Partial Encoder")
+            self.encoder = PartialEncoderEDDI(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
@@ -1558,8 +1627,8 @@ class PARTIALVAE(BaseModuleClass):
             )
 
         elif encoder_type == "PartialEncoderEDDIATSE":
-            print("Using EDDI + ATSE Partial Encoder+Fast")
-            self.encoder = PartialEncoderEDDIATSEFast(
+            print("Using EDDI + ATSE Partial Encoder")
+            self.encoder = PartialEncoderEDDIATSE(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
@@ -1573,8 +1642,8 @@ class PARTIALVAE(BaseModuleClass):
             )
         
         elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
-            print("Using PartialEncoderWeightedSumEDDIMultiWeigh+Fast")
-            self.encoder = PartialEncoderWeightedSumEDDIMultiWeightFast(
+            print("Using PartialEncoderWeightedSumEDDIMultiWeight")
+            self.encoder = PartialEncoderWeightedSumEDDIMultiWeight(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
@@ -1590,8 +1659,8 @@ class PARTIALVAE(BaseModuleClass):
             )
 
         elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
-            print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE+Fast")
-            self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSEFast(
+            print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE")
+            self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSE(
                 input_dim=n_input,
                 code_dim=code_dim,
                 h_hidden_dim=h_hidden_dim,
