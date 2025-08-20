@@ -97,6 +97,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         num_weight_vectors: int = 4,
         temperature_value: float = -1.0, #if temperature_value is set to -1, then the median number of observations is used as the fixed temperature value.
         temperature_fixed: bool = True, #if temperature is fixed, it is fixed to the value of temperature_value
+        forward_style: Literal["per-cell", "batched", "scatter"] = "batched",
         **kwargs,
     ):
         super().__init__(adata)
@@ -119,6 +120,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             num_weight_vectors = num_weight_vectors,
             temperature_value=temperature_value,
             temperature_fixed=temperature_fixed,
+            forward_style=forward_style,
             **kwargs,
         )
 
@@ -133,7 +135,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             f"encode_covariates={encode_covariates}, "
             f"deeply_inject_covariates={deeply_inject_covariates}, "
             f"initialize_embeddings_from_pca={initialize_embeddings_from_pca}, "
-            f"encoder_type={encoder_type}, num_weight_vectors={num_weight_vectors}, temperature_value={temperature_value}, temperature_fixed={temperature_fixed}, pool_mode={pool_mode}."
+            f"encoder_type={encoder_type}, num_weight_vectors={num_weight_vectors}, "
+            f"temperature_value={temperature_value}, temperature_fixed={temperature_fixed}, forward_style={forward_style}, pool_mode={pool_mode}."
         )
 
 
