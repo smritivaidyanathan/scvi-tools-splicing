@@ -821,6 +821,9 @@ class PartialEncoderEDDIFaster(nn.Module):
 
         # h-layer: [psi (1) | F_j (D)] -> D
         in_dim_h = 1 + code_dim
+
+        
+
         self.h_layer = nn.Sequential(
             nn.Linear(in_dim_h, h_hidden_dim),
             nn.LayerNorm(h_hidden_dim),
@@ -873,6 +876,8 @@ class PartialEncoderEDDIFaster(nn.Module):
             mu_logvar = self.encoder_mlp(pooled, *cat_list, cont=cont)  # (B, 2Z)
             mu, logvar = mu_logvar.chunk(2, dim=-1)
             return mu, logvar
+        
+
 
         # Gather only observed inputs
         # psi values for those (b, j) pairs → (N_obs, 1)
@@ -884,6 +889,7 @@ class PartialEncoderEDDIFaster(nn.Module):
         F_obs = F_j.index_select(0, j_idx)    # (N_obs, D)
 
         # Concatenate [psi | F_j] and run h-layer only on observed
+        print(f"N_obs={N_obs}, h_in_shape=({N_obs}, {1 + self.code_dim})")
         h_in  = torch.cat([x_obs, F_obs], dim=1)   # (N_obs, 1 + D)
         h_obs = self.h_layer(h_in)                 # (N_obs, D)
 
@@ -1030,6 +1036,7 @@ class PartialEncoderEDDIATSEFaster(nn.Module):
         inject_covariates: bool = True,
         pool_mode: Literal["mean","sum"] = "mean",
         atse_embedding_dimension: int = 16,
+        max_nobs: int = -1
     ):
         super().__init__()
         self.code_dim = code_dim
@@ -1040,6 +1047,7 @@ class PartialEncoderEDDIATSEFaster(nn.Module):
         self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
         self.n_cont = n_cont
         self.inject_covariates = inject_covariates
+        self.max_nobs = max_nobs
 
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
         self.h_layer = self._make_h_layer(n_atse_embed=0)
@@ -1806,7 +1814,7 @@ class PARTIALVAE(BaseModuleClass):
         temperature_fixed: bool = True, #if temperature is fixed, it is fixed to the value of temperature_value
         forward_style: Literal["per-cell", "batched", "scatter"] = "batched",
         atse_embedding_dimension: int = 16,
-    ):
+        ):
         super().__init__()
         self.encoder_type = encoder_type
 
