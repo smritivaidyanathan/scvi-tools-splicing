@@ -343,6 +343,19 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         deeply_inject_covariates: bool = False,
         encode_covariates: bool = False,
         fully_paired: bool = False,
+
+        #partialencoderflags
+        encoder_hidden_dim: int = 128,
+        latent_dim: int = 10,
+        encoder_type: Literal["PartialEncoderWeightedSumEDDIMultiWeight","PartialEncoderWeightedSumEDDIMultiWeightATSE","PartialEncoderEDDI","PartialEncoderEDDIATSE"] = "PartialEncoderEDDI",
+        pool_mode: Literal["mean","sum"] = "mean",
+        num_weight_vectors: int = 4,
+        temperature_value: float = -1.0,
+        temperature_fixed: bool = True,
+        forward_style: Literal["per-cell","batched","scatter"] = "batched",
+        max_nobs: int = -1,
+        atse_embedding_dimension: int = 16,
+
         **model_kwargs,
     ):
         super().__init__(adata)

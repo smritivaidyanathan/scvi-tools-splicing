@@ -808,6 +808,7 @@ class PartialEncoderEDDIFaster(nn.Module):
         n_cont: int = 0,
         inject_covariates: bool = True,
         pool_mode: Literal["mean", "sum"] = "mean",
+        max_nobs: int = -1,
     ):
         super().__init__()
         self.code_dim = code_dim
@@ -815,6 +816,7 @@ class PartialEncoderEDDIFaster(nn.Module):
         self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
         self.n_cont = n_cont
         self.inject_covariates = inject_covariates
+        self.max_nobs = max_nobs
 
         # Per-junction embedding table (J, D)
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
@@ -869,6 +871,7 @@ class PartialEncoderEDDIFaster(nn.Module):
         # Find observed indices (vectors of shape (N_obs,))
         b_idx, j_idx = mask_bool.nonzero(as_tuple=True)
         N_obs = b_idx.numel()
+        F_j = self.feature_embedding
 
         # Early-exit if nothing is observed
         if N_obs == 0:
@@ -876,26 +879,36 @@ class PartialEncoderEDDIFaster(nn.Module):
             mu_logvar = self.encoder_mlp(pooled, *cat_list, cont=cont)  # (B, 2Z)
             mu, logvar = mu_logvar.chunk(2, dim=-1)
             return mu, logvar
-        
 
+        if (self.max_nobs < 0) or (N_obs <= self.max_nobs):
+            # ---- Original (no chunking) path ----
+            x_obs = x[b_idx, j_idx].unsqueeze(1)       # (N_obs, 1)
+            F_obs = F_j.index_select(0, j_idx)         # (N_obs, D)
 
-        # Gather only observed inputs
-        # psi values for those (b, j) pairs → (N_obs, 1)
-        x_obs = x[b_idx, j_idx].unsqueeze(1)  # (N_obs, 1)
+            h_in  = torch.cat([x_obs, F_obs], dim=1)   # (N_obs, 1 + D)
+            h_obs = self.h_layer(h_in)                 # (N_obs, D)
 
-        # Junction embeddings for those j’s → (N_obs, D)
-        # Works for both nn.Parameter (Tensor) and nn.Embedding.weight
-        F_j = self.feature_embedding
-        F_obs = F_j.index_select(0, j_idx)    # (N_obs, D)
+            pooled = torch.zeros(B, D, device=device, dtype=h_obs.dtype)
+            pooled.index_add_(0, b_idx, h_obs)         # sum over observed rows per cell
 
-        # Concatenate [psi | F_j] and run h-layer only on observed
-        print(f"N_obs={N_obs}, h_in_shape=({N_obs}, {1 + self.code_dim})")
-        h_in  = torch.cat([x_obs, F_obs], dim=1)   # (N_obs, 1 + D)
-        h_obs = self.h_layer(h_in)                 # (N_obs, D)
+        else:
+            # ---- Chunked path: same result, steadier memory ----
+            pooled = None  # defer dtype until we see h_out
+            for start in range(0, N_obs, self.max_nobs):
+                end = min(start + self.max_nobs, N_obs)
 
-        # Scatter-add to pooled per-cell sums
-        pooled = torch.zeros(B, D, device=device, dtype=h_obs.dtype)
-        pooled.index_add_(0, b_idx, h_obs)         # sum over observed rows per cell
+                bi = b_idx[start:end]                  # (n,)
+                jj = j_idx[start:end]                  # (n,)
+
+                x_chunk = x[bi, jj].unsqueeze(1)       # (n, 1)
+                F_chunk = F_j.index_select(0, jj)      # (n, D)
+
+                h_in  = torch.cat([x_chunk, F_chunk], dim=1)  # (n, 1 + D)
+                h_out = self.h_layer(h_in)                     # (n, D)
+
+                if pooled is None:
+                    pooled = torch.zeros(B, D, device=device, dtype=h_out.dtype)
+                pooled.index_add_(0, bi, h_out)
 
         # Mean pooling if requested
         if self.pool_mode == "mean":
@@ -1036,7 +1049,6 @@ class PartialEncoderEDDIATSEFaster(nn.Module):
         inject_covariates: bool = True,
         pool_mode: Literal["mean","sum"] = "mean",
         atse_embedding_dimension: int = 16,
-        max_nobs: int = -1
     ):
         super().__init__()
         self.code_dim = code_dim
@@ -1047,7 +1059,6 @@ class PartialEncoderEDDIATSEFaster(nn.Module):
         self.n_cat_list = [n for n in (n_cat_list or []) if n > 1]
         self.n_cont = n_cont
         self.inject_covariates = inject_covariates
-        self.max_nobs = max_nobs
 
         self.feature_embedding = nn.Parameter(torch.randn(input_dim, code_dim))
         self.h_layer = self._make_h_layer(n_atse_embed=0)
@@ -1814,6 +1825,7 @@ class PARTIALVAE(BaseModuleClass):
         temperature_fixed: bool = True, #if temperature is fixed, it is fixed to the value of temperature_value
         forward_style: Literal["per-cell", "batched", "scatter"] = "batched",
         atse_embedding_dimension: int = 16,
+        max_nobs: int = -1,
         ):
         super().__init__()
         self.encoder_type = encoder_type
@@ -1998,6 +2010,7 @@ class PARTIALVAE(BaseModuleClass):
                     n_cont=n_continuous_cov,
                     inject_covariates=encode_covariates,
                     pool_mode=pool_mode,
+                    max_nobs = max_nobs,
                 )
 
             elif encoder_type == "PartialEncoderEDDIATSE":

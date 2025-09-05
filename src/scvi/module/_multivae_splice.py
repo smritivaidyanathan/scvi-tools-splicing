@@ -12,7 +12,7 @@ from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial, NegativeBinomialMixture, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers, LinearDecoderSCVI
-from scvi.module._partialvae import PartialEncoderEDDI, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
+from scvi.module._partialvae import PartialEncoderEDDI, PartialEncoderEDDIATSE,PartialEncoderWeightedSumEDDIMultiWeight, PartialEncoderWeightedSumEDDIMultiWeightATSE, PartialEncoderEDDIFast, PartialEncoderEDDIATSEFast,PartialEncoderWeightedSumEDDIMultiWeightFast, PartialEncoderWeightedSumEDDIMultiWeightATSEFast, PartialEncoderEDDIFaster, PartialEncoderEDDIATSEFaster,PartialEncoderWeightedSumEDDIMultiWeightFaster, PartialEncoderWeightedSumEDDIMultiWeightATSEFaster, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
 
 from ._utils import masked_softmax
 
@@ -198,6 +198,19 @@ class MULTIVAESPLICE(BaseModuleClass):
         splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
         dm_concentration: Literal["atse", "scalar"] = "atse",
         splicing_concentration: float | None = None,
+
+        #partialencoderflags
+        encoder_hidden_dim: int = 128,
+        latent_dim: int = 10,
+        encoder_type: Literal["PartialEncoderWeightedSumEDDIMultiWeight","PartialEncoderWeightedSumEDDIMultiWeightATSE","PartialEncoderEDDI","PartialEncoderEDDIATSE"] = "PartialEncoderEDDI",
+        pool_mode: Literal["mean","sum"] = "mean",
+        num_weight_vectors: int = 4,
+        temperature_value: float = -1.0,
+        temperature_fixed: bool = True,
+        forward_style: Literal["per-cell","batched","scatter"] = "batched",
+        max_nobs: int = -1,
+        atse_embedding_dimension: int = 16,
+
         **model_kwargs,
     ):
         super().__init__()
@@ -353,29 +366,211 @@ class MULTIVAESPLICE(BaseModuleClass):
                 deep_inject_covariates=deeply_inject_covariates,
             )
         else:
-            # self.z_encoder_splicing = PartialEncoder(
-            # input_dim=input_spl,
-            # code_dim=code_dim,
-            # h_hidden_dim=h_hidden_dim,
-            # encoder_hidden_dim=mlp_encoder_hidden_dim,
-            # latent_dim=encoderlatentdim,
-            # dropout_rate=dropout_rate,
-            # n_cat_list=encoder_cat_list,
-            # n_cont=n_continuous_cov,
-            # inject_covariates=encode_covariates,
-            # )
 
-            self.z_encoder_splicing = PartialEncoderEDDI(
-                input_dim=input_spl,
-                code_dim=code_dim,
-                h_hidden_dim=h_hidden_dim,
-                latent_dim=encoderlatentdim,              # latent_dim comes first
-                encoder_hidden_dim=mlp_encoder_hidden_dim,
-                dropout_rate=dropout_rate,
-                n_cat_list=encoder_cat_list,
-                n_cont=n_continuous_cov,
-                inject_covariates=encode_covariates,
-            )
+            # instantiate the requested encoder
+            if forward_style == "per-cell":
+                if encoder_type == "PartialEncoderEDDI":
+                    print(f"Using EDDI Partial Encoder")
+                    self.encoder = PartialEncoderEDDI(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        pool_mode=pool_mode,
+                    )
+
+                elif encoder_type == "PartialEncoderEDDIATSE":
+                    print("Using EDDI + ATSE Partial Encoder")
+                    self.encoder = PartialEncoderEDDIATSE(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        pool_mode=pool_mode,
+                        atse_embedding_dimension=atse_embedding_dimension
+                    )
+                
+                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
+                    print("Using PartialEncoderWeightedSumEDDIMultiWeight")
+                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeight(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        num_weight_vectors = num_weight_vectors,
+                        temperature_value=temperature_value,
+                        temperature_fixed=temperature_fixed,
+                    )
+
+                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
+                    print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE")
+                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSE(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        num_weight_vectors = num_weight_vectors,
+                        temperature_value=temperature_value,
+                        temperature_fixed=temperature_fixed,
+                        atse_embedding_dimension=atse_embedding_dimension
+                    )
+            elif forward_style == "batched":
+                if encoder_type == "PartialEncoderEDDI":
+                    print(f"Using EDDI Partial Encoder Fast")
+                    self.encoder = PartialEncoderEDDIFast(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        pool_mode=pool_mode,
+                    )
+
+                elif encoder_type == "PartialEncoderEDDIATSE":
+                    print("Using EDDI + ATSE Partial Encoder Fast")
+                    self.encoder = PartialEncoderEDDIATSEFast(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        pool_mode=pool_mode,
+                        atse_embedding_dimension=atse_embedding_dimension
+                    )
+                
+                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
+                    print("Using PartialEncoderWeightedSumEDDIMultiWeight Fast")
+                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightFast(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        num_weight_vectors = num_weight_vectors,
+                        temperature_value=temperature_value,
+                        temperature_fixed=temperature_fixed,
+                    )
+
+                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
+                    print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE Fast")
+                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSEFast(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        num_weight_vectors = num_weight_vectors,
+                        temperature_value=temperature_value,
+                        temperature_fixed=temperature_fixed,
+                        atse_embedding_dimension=atse_embedding_dimension
+                    )
+            elif forward_style == "scatter":
+                if encoder_type == "PartialEncoderEDDI":
+                    print(f"Using EDDI Partial Encoder Faster")
+                    self.encoder = PartialEncoderEDDIFaster(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        pool_mode=pool_mode,
+                        max_nobs = max_nobs,
+                    )
+
+                elif encoder_type == "PartialEncoderEDDIATSE":
+                    print("Using EDDI + ATSE Partial Encoder Faster")
+                    self.encoder = PartialEncoderEDDIATSEFaster(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        pool_mode=pool_mode,
+                        atse_embedding_dimension=atse_embedding_dimension,
+                    )
+
+                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
+                    print("Using PartialEncoderWeightedSumEDDIMultiWeight Faster")
+                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightFaster(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        num_weight_vectors=num_weight_vectors,
+                        temperature_value=temperature_value,
+                        temperature_fixed=temperature_fixed,
+                    )
+
+                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
+                    print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE Faster")
+                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSEFaster(
+                        input_dim=input_spl,
+                        code_dim=code_dim,
+                        h_hidden_dim=h_hidden_dim,
+                        encoder_hidden_dim=encoder_hidden_dim,
+                        latent_dim=n_latent,
+                        dropout_rate=dropout_rate,
+                        n_cat_list=encoder_cat_list,
+                        n_cont=n_continuous_cov,
+                        inject_covariates=encode_covariates,
+                        num_weight_vectors=num_weight_vectors,
+                        temperature_value=temperature_value,
+                        temperature_fixed=temperature_fixed,
+                        atse_embedding_dimension=atse_embedding_dimension,
+                    )
+
+                else:
+                    raise ValueError(f"Unknown encoder_type={encoder_type!r}")
+                
 
             if latent_distribution == "ln":
                 self.z_encoder_splicing.z_transformation = nn.Softmax(dim=-1)
