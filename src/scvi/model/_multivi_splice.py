@@ -57,6 +57,8 @@ import torch
 from scvi.train import AdversarialTrainingPlan
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
+import scipy.sparse as sp
+from sklearn.decomposition import TruncatedSVD
 
 class MyAdvTrainingPlan(AdversarialTrainingPlan):
 
@@ -69,9 +71,11 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
         step_size: int = 10,
         gradient_clipping: bool = True,
         gradient_clipping_max_norm: float = 5.0,
+        cross_gate_mode: str = "hard",
         **kwargs,
     ):
         super().__init__(module=module, **kwargs)
+        self.cross_gate_mode = cross_gate_mode  # "hard" or "soft"
         # new scheduling params
         self.lr_scheduler_type = lr_scheduler_type
         self.step_size = step_size
@@ -115,6 +119,16 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
             on_epoch=False,  # not aggregated at epoch end
         )
 
+    def _compute_gate(self) -> float:
+        # KL warmup drives self.kl_weight from 0→1
+        if self.cross_gate_mode == "soft":
+            return float(self.kl_weight)                 # gradually open
+        return 1.0 if float(self.kl_weight) >= 0.999 else 0.0  # snap open when warmup done
+    
+    def on_validation_epoch_start(self):
+        if hasattr(self.module, "set_cross_gate"):
+            self.module.set_cross_gate(1.0)  # always open for validation
+
     def on_validation_epoch_end(self) -> None:
         """Update the learning rate via scheduler steps."""
         if self.lr_scheduler_type == "step":
@@ -130,6 +144,7 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
 
     def configure_optimizers(self):
         """Configure optimizers for adversarial training."""
+        print("Configuring optimizers")
         params1 = filter(lambda p: p.requires_grad, self.module.parameters())
         optimizer1 = self.get_optimizer_creator()(params1)
         config1 = {"optimizer": optimizer1}
@@ -191,6 +206,13 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
         if "kl_weight" in self.loss_kwargs:
             self.loss_kwargs.update({"kl_weight": self.kl_weight})
             self.log("kl_weight", self.kl_weight, on_step=True, on_epoch=False)
+
+        #toggle cross gate right before forward <<<
+        if hasattr(self.module, "set_cross_gate"):
+            gate = self._compute_gate()
+            self.module.set_cross_gate(gate)
+            self.log("cross_gate", gate, on_step=True, on_epoch=False)
+
         kappa = (
             1 - self.kl_weight
             if self.scale_adversarial_loss == "auto"
@@ -238,79 +260,119 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
 class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin):
     """Integration of gene expression and alternative splicing signals.
 
-    MULTIVISPLICE is designed to integrate multiomic data that includes gene
-    expression and alternative splicing measurements (e.g. junction usage ratios).
-    
+    MULTIVISPLICE integrates gene expression and alternative splicing (junction-usage) modalities,
+    learning a joint latent space with reconstruction heads per modality. It wraps the
+    :class:`~scvi.module.MULTIVAESPLICE` module and adds training utilities and convenience APIs.
+
     Parameters
     ----------
     adata
         AnnData/MuData object that has been registered via
         :meth:`~scvi.model.MULTIVISPLICE.setup_anndata` or
         :meth:`~scvi.model.MULTIVISPLICE.setup_mudata`.
-    n_genes
-        The number of gene expression features.
-    n_junctions
-        The number of alternative splicing features (junctions).
+
+    # --- Modality mixing ---
     modality_weights
-        Weighting scheme across modalities. Must be one of:
-            * ``"equal"``: equal weight per modality,
-            * ``"universal"``: learn a universal weight for each modality,
-            * ``"cell"``: learn cell-specific weights.
-            * ``"concatenate"``: do not mix the two representations and instead concatenate them
+        How to weight modalities when forming the joint latent:
+        * ``"equal"`` – equal weight per modality,
+        * ``"universal"`` – one global weight per modality (learned),
+        * ``"cell"`` – per-cell weights (learned),
+        * ``"concatenate"`` – do not mix; concatenate per-modality latents.
     modality_penalty
-        Penalty applied during training. Options are ``"Jeffreys"``, ``"MMD"``, or ``"None"``.
-    n_hidden
-        Number of nodes per hidden layer. If `None`, defaults to the square root of `n_junctions`.
-    n_latent
-        Dimensionality of the latent space. If `None`, defaults to the square root of `n_hidden`.
-    n_layers_encoder
-        Number of hidden layers used in the encoder networks.
-    n_layers_decoder
-        Number of hidden layers used in the decoder networks.
-    dropout_rate
-        Dropout rate for the networks.
-    region_factors
-        Whether to include junction‐specific factors in the model.
+        Alignment penalty across modalities: ``"Jeffreys"``, ``"MMD"``, or ``"None"``.
+
+    # --- Likelihoods & dispersion (expression) ---
     gene_likelihood
-        Likelihood for gene expression. One of: ``"zinb"``, ``"nb"``, ``"poisson"``.
+        Expression likelihood: ``"zinb"``, ``"nb"``, or ``"poisson"``.
     dispersion
-        Dispersion configuration. Options are: ``"gene"``, ``"gene-batch"``, ``"gene-label"``, or ``"gene-cell"``.
+        Expression dispersion parameterization: ``"gene"``, ``"gene-batch"``, ``"gene-label"``, or ``"gene-cell"``.
+
+    # --- Architecture toggles ---
     splicing_architecture
-        Which encoder/decoder to use for splicing. One of:
-        * ``"vanilla"``: standard SCVI `Encoder` + `DecoderSplice`,
-        * ``"partial"``: `PartialEncoder` + `LinearDecoder` with per‐feature embeddings.
+        Splicing branch type:
+        * ``"vanilla"`` – SCVI `Encoder` + `DecoderSplice`,
+        * ``"partial"`` – PartialEncoder family + `LinearDecoder`.
     expression_architecture
-        Which decoder to use for gene expression. One of:
-        * ``"vanilla"``: standard SCVI `Encoder` +  Standard SCVI Decoder
-        * ``"linear"``: standard SCVI `Encoder` + Linear SCVI Decoder
-    code_dim
-        Dimensionality of per‐feature embeddings in the *partial* encoder (only used when `splicing_architecture="partial"`).
-    h_hidden_dim
-        Hidden size of the shared “h” network in `PartialEncoder` (only for `"partial"`).
-    mlp_encoder_hidden_dim
-        Hidden size of the final MLP in `PartialEncoder` (only for `"partial"`).
-    initialize_embeddings_from_pca
-        Whether or not to initalize the embedding layer for the Partial Encoder using PCA of junction ratios (only for `"partial"`).
+        Expression decoder: ``"vanilla"`` (nonlinear) or ``"linear"`` (linear decoder).
+
+    # --- Shared SCVI-style encoder/decoder hyperparameters ---
+    n_hidden
+        Width of SCVI encoders/decoders. If `None`, uses √(n_junctions) (capped at 128).
+    n_latent
+        Joint latent dimensionality (per-modality before concatenation). If `None`, uses √(n_hidden).
+    n_layers_encoder
+        Hidden layers in encoders.
+    n_layers_decoder
+        Hidden layers in decoders (not used by the linear decoder).
+    dropout_rate
+        Dropout rate in MLPs.
     use_batch_norm
-        Which layers to apply batch normalization to. Options: ``"encoder"``, ``"decoder"``, ``"both"``, or ``"none"``.
+        Where to apply batch norm: ``"encoder"``, ``"decoder"``, ``"both"``, or ``"none"``.
     use_layer_norm
-        Which layers to apply layer normalization to. Options: ``"encoder"``, ``"decoder"``, ``"both"``, or ``"none"``.
+        Where to apply layer norm: ``"encoder"``, ``"decoder"``, ``"both"``, or ``"none"``.
     latent_distribution
-        Latent space distribution; either ``"normal"`` or ``"ln"`` (logistic normal).
+        Latent distribution: ``"normal"`` or ``"ln"`` (logistic normal).
     deeply_inject_covariates
-        Whether to deeply inject covariates into all layers of the decoder.
+        If True, injects covariates at all decoder layers.
     encode_covariates
-        Whether to encode covariates.
+        If True, provides covariates to encoders.
+
+    # --- Splicing likelihood ---
+    splicing_loss_type
+        Splicing reconstruction loss: ``"binomial"``, ``"beta_binomial"``, or ``"dirichlet_multinomial"``.
+    splicing_concentration
+        Optional concentration for beta-binomial; ignored for binomial.
+    dm_concentration
+        For Dirichlet-multinomial: ``"atse"`` (per-ATSE concentration) or ``"scalar"`` (single shared).
+
+    # --- PartialEncoder knobs (used when splicing_architecture="partial") ---
+    encoder_hidden_dim
+        Hidden width inside the PartialEncoder MLP.
+    encoder_type
+        One of:
+        ``"PartialEncoderEDDI"``, ``"PartialEncoderEDDIATSE"``,
+        ``"PartialEncoderWeightedSumEDDIMultiWeight"``,
+        ``"PartialEncoderWeightedSumEDDIMultiWeightATSE"``.
+    forward_style
+        Implementation style for PartialEncoder forward pass: ``"per-cell"``, ``"batched"``, or ``"scatter"``.
+    code_dim
+        Dimensionality of per-feature embeddings in PartialEncoder.
+    h_hidden_dim
+        Hidden width of the shared “h” network in PartialEncoder.
+    pool_mode
+        Pooling across observed features: ``"mean"`` or ``"sum"``.
+    atse_embedding_dimension
+        ATSE embedding size for ATSE-aware encoder variants.
+    num_weight_vectors
+        Number of weight vectors for the WeightedSum variants.
+    temperature_value
+        Initial temperature for soft selection in WeightedSum variants (set <0 to use internal default).
+    temperature_fixed
+        If True, keep the temperature fixed; otherwise learn it.
+    max_nobs
+        Cap for number of observations considered in the ``"scatter"`` path (−1 disables).
+
+    # --- Dataset shape/bookkeeping (inferred when possible) ---
+    n_genes
+        Number of gene expression features. Required if `adata` is AnnData.
+    n_junctions
+        Number of splicing features. Required if `adata` is AnnData.
+
+    # --- Model-only options ---
+    initialize_embeddings_from_pca
+        If True and using a PartialEncoder, initialize its feature embedding via PCA on junction ratios.
     fully_paired
-        Indicates if the data is fully paired across modalities.
+        If True, the model exposes only a joint latent (no modality-specific latents).
+
     **model_kwargs
-        Additional keyword arguments for :class:`~scvi.module.MULTIVAESPLICE`.
-    
+        Forwarded to :class:`~scvi.module.MULTIVAESPLICE`.
+
     Notes
     -----
-    * This model integrates only gene expression and splicing data.  
+    * This wrapper integrates only gene expression and splicing data.
     * The splicing modality does not use library size factors.
     """
+
     _module_cls = MULTIVAESPLICE
     _training_plan_cls = MyAdvTrainingPlan
 
@@ -319,43 +381,59 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         adata: AnnOrMuData,
         n_genes: int | None = None,
         n_junctions: int | None = None,
+
+        # --- Modality mixing ---
         modality_weights: Literal["equal", "cell", "universal", "concatenate"] = "equal",
         modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
+
+        # --- Shared SCVI-style encoder/decoder hyperparameters ---
         n_hidden: int | None = None,
         n_latent: int | None = None,
         n_layers_encoder: int = 2,
         n_layers_decoder: int = 2,
         dropout_rate: float = 0.1,
-        gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
-        splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
-        dm_concentration: Literal["atse", "scalar"] = "atse",
-        splicing_concentration: float | None = None,
-        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
-        splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
-        expression_architecture: Literal["vanilla", "linear"] = "vanilla",
-        code_dim: int = 32,
-        h_hidden_dim: int = 64,
-        mlp_encoder_hidden_dim: int = 128,
-        initialize_embeddings_from_pca: bool = True,
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         latent_distribution: Literal["normal", "ln"] = "normal",
         deeply_inject_covariates: bool = False,
         encode_covariates: bool = False,
-        fully_paired: bool = False,
 
-        #partialencoderflags
+        # --- Likelihoods & dispersion (expression) ---
+        gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
+        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
+
+        # --- Splicing likelihood ---
+        splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
+        dm_concentration: Literal["atse", "scalar"] = "atse",
+        splicing_concentration: float | None = None,
+
+        # --- Architecture toggles ---
+        splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
+        expression_architecture: Literal["vanilla", "linear"] = "vanilla",
+
+        # --- PartialEncoder knobs (splicing_architecture="partial") ---
         encoder_hidden_dim: int = 128,
-        latent_dim: int = 10,
-        encoder_type: Literal["PartialEncoderWeightedSumEDDIMultiWeight","PartialEncoderWeightedSumEDDIMultiWeightATSE","PartialEncoderEDDI","PartialEncoderEDDIATSE"] = "PartialEncoderEDDI",
-        pool_mode: Literal["mean","sum"] = "mean",
+        encoder_type: Literal[
+            "PartialEncoderWeightedSumEDDIMultiWeight",
+            "PartialEncoderWeightedSumEDDIMultiWeightATSE",
+            "PartialEncoderEDDI",
+            "PartialEncoderEDDIATSE"
+        ] = "PartialEncoderEDDI",
+        forward_style: Literal["per-cell", "batched", "scatter"] = "batched",
+        code_dim: int = 16,
+        h_hidden_dim: int = 64,
+        pool_mode: Literal["mean", "sum"] = "mean",
+        atse_embedding_dimension: int = 16,
         num_weight_vectors: int = 4,
         temperature_value: float = -1.0,
         temperature_fixed: bool = True,
-        forward_style: Literal["per-cell","batched","scatter"] = "batched",
         max_nobs: int = -1,
-        atse_embedding_dimension: int = 16,
 
+        # --- Model-only helpers ---
+        initialize_embeddings_from_pca: bool = True,
+        fully_paired: bool = False,
+
+        # (module bookkeeping inferred from data managers)
         **model_kwargs,
     ):
         super().__init__(adata)
@@ -367,16 +445,14 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             n_genes = self.summary_stats.get("n_vars", 0)
             n_junctions = self.summary_stats.get("n_junc", 0)
 
-        prior_mean, prior_scale = None, None
         n_cats_per_cov = (
             self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
             if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
             else []
         )
-
-        # Splicing modality does not use library size factors.
         use_size_factor_key = REGISTRY_KEYS.SIZE_FACTOR_KEY in self.adata_manager.data_registry
 
+        # ---- instantiate the module (pass every MODULE parameter, and only those) ----
         self.module = self._module_cls(
             n_input_genes=n_genes,
             n_input_junctions=n_junctions,
@@ -384,6 +460,9 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             modality_penalty=modality_penalty,
             n_batch=self.summary_stats.n_batch,
             n_obs=adata.n_obs,
+            n_labels=self.summary_stats.get("n_labels", 0),
+
+            # shared SCVI-style
             n_hidden=n_hidden,
             n_latent=n_latent,
             n_layers_encoder=n_layers_encoder,
@@ -391,37 +470,60 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             n_continuous_cov=self.summary_stats.get("n_extra_continuous_covs", 0),
             n_cats_per_cov=n_cats_per_cov,
             dropout_rate=dropout_rate,
-            splicing_loss_type = splicing_loss_type,
-            splicing_concentration = splicing_concentration,
-            dm_concentration= dm_concentration,
-            gene_likelihood=gene_likelihood,
-            gene_dispersion=dispersion,
-            splicing_architecture = splicing_architecture,
-            expression_architecture = expression_architecture, 
-            code_dim= code_dim,
-            h_hidden_dim= h_hidden_dim,
-            mlp_encoder_hidden_dim= mlp_encoder_hidden_dim,
             use_batch_norm=use_batch_norm,
             use_layer_norm=use_layer_norm,
-            use_size_factor_key=use_size_factor_key,
             latent_distribution=latent_distribution,
             deeply_inject_covariates=deeply_inject_covariates,
             encode_covariates=encode_covariates,
+            use_size_factor_key=use_size_factor_key,
+
+            # likelihoods
+            gene_likelihood=gene_likelihood,
+            gene_dispersion=dispersion,
+            splicing_loss_type=splicing_loss_type,
+            splicing_concentration=splicing_concentration,
+            dm_concentration=dm_concentration,
+
+            # architectures
+            splicing_architecture=splicing_architecture,
+            expression_architecture=expression_architecture,
+
+            # partial-encoder knobs
+            encoder_hidden_dim=encoder_hidden_dim,
+            encoder_type=encoder_type,
+            forward_style=forward_style,
+            code_dim=code_dim,
+            h_hidden_dim=h_hidden_dim,
+            pool_mode=pool_mode,
+            atse_embedding_dimension=atse_embedding_dimension,
+            num_weight_vectors=num_weight_vectors,
+            temperature_value=temperature_value,
+            temperature_fixed=temperature_fixed,
+            max_nobs=max_nobs,
+
+            # extras
             **model_kwargs,
         )
 
+        # ---- model summary (module + key model-only bits) ----
         self._model_summary_string = (
-            f"MultiVI Splice Model with n_genes={n_genes}, n_junctions={n_junctions}, "
+            f"MultiVI-Splice | genes={n_genes}, junctions={n_junctions} | "
             f"n_hidden={self.module.n_hidden}, n_latent={self.module.n_latent}, "
-            f"n_layers_encoder={n_layers_encoder}, n_layers_decoder={n_layers_decoder}, "
-            f"dropout_rate={dropout_rate}, latent_distribution={latent_distribution}, "
-            f"expression_architecture={expression_architecture}, "
-            f"splicing_architecture={splicing_architecture}, code_dim={code_dim}, "
-            f"splicing_loss_type={splicing_loss_type}, splicing_concentration={splicing_concentration}, init_from_pca={initialize_embeddings_from_pca}, "
-            f"h_hidden_dim={h_hidden_dim}, mlp_encoder_hidden_dim={mlp_encoder_hidden_dim}, "
-            f"gene_likelihood={gene_likelihood}, dispersion={dispersion}, "
-            f"modality_weights={modality_weights}, modality_penalty={modality_penalty}"
+            f"enc_layers={n_layers_encoder}, dec_layers={n_layers_decoder}, "
+            f"dropout={dropout_rate}, z_dist={latent_distribution} | "
+            f"expr_dec={expression_architecture}, spl_arch={splicing_architecture} | "
+            f"gene_like={gene_likelihood}, disp={dispersion} | "
+            f"splicing_loss={splicing_loss_type}, dm_conc={dm_concentration}, "
+            f"sp_conc={splicing_concentration} | "
+            f"mix={modality_weights}, penalty={modality_penalty} | "
+            f"PE(type={encoder_type}, code_dim={code_dim}, h_hidden={h_hidden_dim}, "
+            f"enc_hidden={encoder_hidden_dim}, pool={pool_mode}, "
+            f"nW={num_weight_vectors}, temp={temperature_value}, "
+            f"temp_fixed={temperature_fixed}, fwd={forward_style}, "
+            f"max_nobs={max_nobs}, atse_emb={atse_embedding_dimension}) | "
+            f"init_from_pca={initialize_embeddings_from_pca}"
         )
+
         self.fully_paired = fully_paired
         self.n_latent = n_latent
         self.init_params_ = self._get_init_params(locals())
@@ -431,10 +533,33 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         self.dm_concentration = dm_concentration
 
         if self.adata is not None:
-                if initialize_embeddings_from_pca and splicing_architecture == "partial":
-                    self.init_feature_embedding_from_adata()
-                if splicing_loss_type == "dirichlet_multinomial":
-                    self.init_junc2atse()
+            if initialize_embeddings_from_pca and splicing_architecture == "partial":
+                self.init_feature_embedding_from_adata()
+            if splicing_loss_type == "dirichlet_multinomial":
+                self.init_junc2atse()
+                if "atse" in encoder_type.lower():
+                    print("Registering junc2ATSE")
+                    self.module.z_encoder_splicing.register_junc2atse(self.module.junc2atse)
+                if "multi" in encoder_type.lower():
+                    print("Multi in encoder type")
+                    if self.module.z_encoder_splicing.temperature_value < 0.0:
+                        print("Resetting temperature value.")
+                        self.set_median_obs_temperature()
+    
+    def set_median_obs_temperature(self):
+        M = self.adata.layers["psi_mask"]
+        if sp.issparse(M):
+            # per-row nonzeros, memory-light
+            counts = M.tocsr().getnnz(axis=1)
+            median_obs = np.median(counts)
+        else:
+            # works for bool or 0/1 dense
+            median_obs = np.median(np.count_nonzero(M, axis=1))
+
+        T = 1.0 / max(np.sqrt(float(median_obs)), 1.0)
+        print(f"Resetting temperature_value to 1/sqrt(median n_obs). median(n_obs)={median_obs}, T={T:.6f}")
+        self.module.z_encoder_splicing.temperature_value= T  # python float is fine
+
 
     def make_junc2atse(self, atse_labels):
         print("Making Junc2Atse...")
@@ -465,59 +590,30 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         j2a = self.make_junc2atse(atse_labels)
         self.module.junc2atse = j2a.coalesce().to(self.module.device)
 
+
+
     def init_feature_embedding_from_adata(self) -> None:
-        """
-        Center the `junc_ratio` layer, run PCA on it, and copy
-        the resulting components into the encoder.feature_embedding.
-        Entries where ATSE count == 0 are temporarily set to NaN
-        so that nanmean skips them.
-        """
-
-        from sklearn.decomposition import PCA
-        import scipy.sparse as sp
-        import numpy as np
-        import torch
-
-        print("Initializing Feature Embeddings...")
+        print("Initializing feature embeddings...")
         jr_info = self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY]
         jr_key, mod_key = jr_info.attr_key, jr_info.mod_key
-
-        ac_info = self.adata_manager.data_registry["atse_counts_key"]
-        ac_key = ac_info.attr_key
-
-        # 2) Grab as CSR matrices
         X = self.adata[mod_key].layers[jr_key]
-        C = self.adata[mod_key].layers[ac_key]
+        # keep X sparse:
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
 
-        # 2) densify and cast
-        if sp.issparse(X):
-            X = X.toarray()
-        X = np.asarray(X, dtype=float)
-    
-        if sp.issparse(C):
-            C = C.toarray()
-        # set all X entries to NaN where C == 0
-        X[C == 0] = np.nan
-        # ——————————————————————————————————————————————————
+        # fit a (code_dim)-component SVD on the sparse X
+        svd = TruncatedSVD(n_components=self.module.z_encoder_splicing.code_dim,
+                        algorithm="randomized")
+        svd.fit(X)
 
-        # 3) column‐wise centering (ignores those NaNs)
-        col_means = np.nanmean(X, axis=0)
-        X_centered = X - col_means[None, :]
-        # turn the NaNs (masked spots) into zeros
-        X_centered[np.isnan(X_centered)] = 0.0
+        # components_.shape == (n_components, n_vars)
+        comps = svd.components_.T  # (n_vars, code_dim)
 
-        # 4) PCA
-        pca = PCA(n_components=self.module.z_encoder_splicing.code_dim)
-        pca.fit(X_centered)
-        comps = pca.components_.T  # (n_vars, code_dim)
-
-        # 5) copy into the encoder
         with torch.no_grad():
-            self.module.z_encoder_splicing.feature_embedding.copy_(
-                torch.as_tensor(comps, dtype=self.module.z_encoder_splicing.feature_embedding.dtype)
-            )
-        X[C == 0] = 0
-        print("Initialized Feature Embeddings!")
+            emb = self.module.z_encoder_splicing.feature_embedding
+            emb.copy_(torch.as_tensor(comps, dtype=emb.dtype, device=emb.device))
+        print("Initialized feature embeddings...")
+
 
 
     @devices_dsp.dedent

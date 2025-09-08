@@ -90,129 +90,221 @@ class DecoderSplice(torch.nn.Module):
 
 
 class MULTIVAESPLICE(BaseModuleClass):
-    """Variational auto-encoder for joint paired and unpaired RNA-seq and alternative splicing data.
+    """
+    Variational auto-encoder for joint (paired or unpaired) RNA-seq gene expression
+    and alternative splicing (junction usage). Two encoder–decoder branches (expression,
+    splicing) produce/posterior latents that are mixed into a shared latent space z.
 
-    This module is an adaptation of MultiVAE. integrates gene expression and alternative splicing (junction usage ratios)
-    by means of two separate encoder-decoder branches that are fused into a joint latent space.
-    Reconstruction is performed for gene expression and splicing separately.
+    Reconstruction is performed per modality; optional penalties align the two posteriors.
 
     Parameters
     ----------
+    # --- Data & bookkeeping ---
     n_input_genes : int
-        Number of gene expression features.
+        Number of gene-expression features (G).
     n_input_junctions : int
-        Number of alternative splicing (junction) features.
-    modality_weights : Literal["equal", "cell", "universal", "concatenate"], default "equal"
-        Weighting scheme across modalities.
-        If "concatenate", then modality latent spaces are not mixed and instead concatenated.
-    modality_penalty : Literal["Jeffreys", "MMD", "None"], default "Jeffreys"
-        Penalty to align the latent distributions.
+        Number of splicing junction features (J).
     n_batch : int, default 0
-        Number of batches (for batch correction).
+        Number of batches for batch-correction (categorical covariate).
     n_obs : int, default 0
-        Number of observations.
+        Number of observations (cells); needed when modality_weights="cell".
     n_labels : int, default 0
-        Number of cell labels.
-    gene_likelihood : Literal["zinb", "nb", "poisson"], default "zinb"
-        Likelihood model for gene expression.
-    gene_dispersion : Literal["gene", "gene-batch", "gene-label", "gene-cell"], default "gene"
-        Dispersion configuration for gene expression.
-    n_hidden : int or None, default None
-        Number of hidden units per layer. If None, a heuristic is used.
-    n_latent : int or None, default None
-        Dimensionality of the latent space. If None, a heuristic is used.
-    n_layers_encoder : int, default 2
-        Number of layers in the encoder networks.
-    n_layers_decoder : int, default 2
-        Number of layers in the decoder networks.
+        Number of labels (for gene_dispersion="gene-label").
+    n_cats_per_cov : Iterable[int] or None, default None
+        Category counts for each categorical covariate provided.
     n_continuous_cov : int, default 0
         Number of continuous covariates.
-    n_cats_per_cov : Iterable[int] or None, default None
-        List with the number of categories per categorical covariate.
-    dropout_rate : float, default 0.1
-        Dropout rate.
-    region_factors : bool, default True
-        Whether to include junction-specific factors.
-    splicing_architecture : Literal["vanilla","partial"]
-        If ``"vanilla"``, uses standard SCVI `Encoder`+`DecoderSplice`.
-        If ``"partial"``, uses `PartialEncoder`+`LinearDecoder`.
-    code_dim : int
-        Dimensionality of per‐feature embeddings in `PartialEncoder` (only for `"partial"`).
-    h_hidden_dim : int
-        Hidden size of shared “h” network in `PartialEncoder` (only for `"partial"`).
-    mlp_encoder_hidden_dim : int
-        Hidden size of the final MLP in `PartialEncoder` (only for `"partial"`).
-    use_batch_norm : Literal["encoder", "decoder", "none", "both"], default "none"
-        Where to apply batch normalization.
-    use_layer_norm : Literal["encoder", "decoder", "none", "both"], default "both"
-        Where to apply layer normalization.
-    latent_distribution : Literal["normal", "ln"], default "normal"
-        Latent distribution type.
-    deeply_inject_covariates : bool, default False
-        Whether to deeply inject covariate information into decoders.
-    encode_covariates : bool, default False
-        Whether to provide covariates to the encoders.
+
+    # --- Likelihoods & dispersion (expression) ---
+    gene_likelihood : {"zinb","nb","poisson"}, default "zinb"
+        Expression likelihood.
+    gene_dispersion : {"gene","gene-batch","gene-label","gene-cell"}, default "gene"
+        Dispersion layout for expression.
     use_size_factor_key : bool, default False
-        Whether to use a size-factor field for gene expression.
-    splicing_loss_type : Literal["binomial", "beta_binomial", "dirichlet_multinomial"], default "beta_binomial"
-        Loss type used for splicing reconstruction.
+        If True, use provided library-size factors for expression (softplus scale);
+        else learn a library-size encoder (see LibrarySizeEncoder).
+
+    # --- Architecture toggles ---
+    splicing_architecture : {"vanilla","partial"}, default "vanilla"
+        • "vanilla": SCVI Encoder + (nonlinear) DecoderSplice (FCLayers).  
+        • "partial": PartialEncoder* variants + Linear splicing decoder.
+    expression_architecture : {"vanilla","linear"}, default "vanilla"
+        Decoder for expression:
+        • "vanilla": non-linear DecoderSCVI (FCLayers).  
+        • "linear" : LinearDecoderSCVI.
+
+    # --- Shared SCVI-style encoder/decoder hyperparameters (used by expression
+    #     encoder/decoder, LibrarySizeEncoder, and splicing *when* splicing_architecture="vanilla") ---
+    n_hidden : int or None, default None
+        Hidden width for SCVI-style MLPs. If None, defaults to ~sqrt(J) (cap at 128) or sqrt(G).
+    n_latent : int or None, default None
+        Latent dimensionality. If None, defaults to ~sqrt(n_hidden). When
+        modality_weights="concatenate", the *mixed* latent is doubled internally.
+    n_layers_encoder : int, default 2
+        Depth of SCVI encoders (expression, and splicing if "vanilla").
+    n_layers_decoder : int, default 2
+        Depth of non-linear decoders (expression "vanilla", splicing "vanilla").
+        Not used by linear decoders.
+
+    dropout_rate : float, default 0.1
+        Dropout for SCVI-style MLPs.
+    use_batch_norm : {"encoder","decoder","none","both"}, default "none"
+        Apply BatchNorm to encoder/decoder stacks.
+    use_layer_norm : {"encoder","decoder","none","both"}, default "both"
+        Apply LayerNorm to encoder/decoder stacks.
+    latent_distribution : {"normal","ln"}, default "normal"
+        Posterior family for encoders. If "ln" (logistic-normal), the latent sample is
+        softmax-transformed before decoding.
+
+    deeply_inject_covariates : bool, default False
+        Deeply inject (cat/cont) covariates into decoder layers.
+    encode_covariates : bool, default False
+        Concatenate continuous covariates to encoder inputs and pass categorical
+        covariates via `n_cat_list`.
+
+    # --- Splicing likelihood ---
+    splicing_loss_type : {"binomial","beta_binomial","dirichlet_multinomial"}, default "beta_binomial"
+        Reconstruction loss for splicing.
+        • "binomial": needs (junc_counts, atse_counts).  
+        • "beta_binomial": same as binomial but with concentration φ_j (per junction).  
+        • "dirichlet_multinomial": uses grouped softmax within ATSEs.
     splicing_concentration : float or None, default None
-        Concentration parameter used for the beta-binomial loss (if applicable).
+        Optional scalar concentration (used by beta-binomial if provided).
+    dm_concentration : {"atse","scalar"}, default "atse"
+        For Dirichlet–multinomial: whether φ is per-ATSE or a global scalar
+        (internally mapped to per-junction as needed).
+
+    # --- PartialEncoder (splicing_architecture="partial") knobs ONLY ---
+    encoder_type : {"PartialEncoderEDDI","PartialEncoderEDDIATSE",
+                    "PartialEncoderWeightedSumEDDIMultiWeight",
+                    "PartialEncoderWeightedSumEDDIMultiWeightATSE"}, default "PartialEncoderEDDI"
+        Choice of PartialEncoder family/variant (ATSE-aware and/or weighted-sum gating).
+    forward_style : {"per-cell","batched","scatter"}, default "batched"
+        Implementation variant for speed/memory trade-offs (Fast/Faster classes under the hood).
+    code_dim : int, default 16
+        Dimensionality of per-junction codes before pooling.
+    h_hidden_dim : int, default 64
+        Hidden width of the per-junction “h” subnetwork (feature MLP) that builds codes.
+    encoder_hidden_dim : int, default 128
+        Hidden width of the post-pooling MLP that maps pooled features → (μ, logσ²) of z.
+    pool_mode : {"mean","sum"}, default "mean"
+        Aggregation of per-junction codes within each cell (and within ATSEs when applicable).
+    atse_embedding_dimension : int, default 16
+        ATSE-level embedding size (ATSE-aware variants only).
+    num_weight_vectors : int, default 4
+        Number of mixture weight vectors for MultiWeight variants.
+    temperature_value : float, default -1.0
+        Initial temperature for gating (if <0, use internal default).
+    temperature_fixed : bool, default True
+        If True, keep gating temperature fixed; else learn it.
+    max_nobs : int, default -1
+        (scatter mode) Optional cap on observed entries processed per step.
+
+    # --- Modality mixing ---
+    modality_weights : {"equal","cell","universal","concatenate"}, default "equal"
+        How to combine expression & splicing posteriors:
+        • "equal"     : uniform weights.  
+        • "universal" : learn one weight per modality.  
+        • "cell"      : learn weights per cell.  
+        • "concatenate": do not mix; concat latents (z_expr || z_spl).
+    modality_penalty : {"Jeffreys","MMD","None"}, default "Jeffreys"
+        Alignment penalty between the two posteriors on paired cells.
+
     **model_kwargs :
-        Additional keyword arguments for the encoders/decoders.
+        Forwarded to underlying components (encoders/decoders).
 
     Notes
     -----
-    Protein-related functionality has been removed.
-    Compatibility with AnnData and MuData is handled via the AnnDataManager in the model’s setup.
+    • SCVI-style hyperparameters (`n_hidden`, `n_layers_encoder/decoder`, `dropout_rate`,
+      normalization flags) control the expression branch and the splicing branch only when
+      `splicing_architecture="vanilla"`. They do **not** affect PartialEncoder internals.
+
+    • PartialEncoder-specific widths:
+        - `h_hidden_dim`   : per-junction feature network width.
+        - `encoder_hidden_dim` : post-pooling MLP width (to z stats).
+        - `code_dim`       : per-junction code dimensionality before pooling.
+
+    • If `latent_distribution="ln"`, both encoders output logits that are softmaxed into
+      simplex-valued latents prior to decoding.
+
+    • Splicing losses:
+        - Binomial/Beta-binomial expect `junc_counts` (successes) and `atse_counts`
+          (trials). Beta-binomial uses φ_j = softplus(log_phi_j); an L2 prior on log_phi_j
+          is applied during training.
+        - Dirichlet–multinomial performs ATSE-wise softmax and supports φ as scalar or
+          per-ATSE; values are mapped to per-junction when needed.
+
+    • When `modality_weights="concatenate"`, the *mixed* latent doubles its size
+      (z = [z_expr, z_spl]); penalties are skipped in this mode.
+
+    • Protein modality is not supported. AnnData/MuData handling occurs in the model
+      wrapper (AnnDataManager in setup).
+
     """
+
     def __init__(
         self,
+        # --- Data & bookkeeping ---
         n_input_genes: int = 0,
         n_input_junctions: int = 0,
-        modality_weights: Literal["equal", "cell", "universal", "concatenate"] = "equal",
-        modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
         n_batch: int = 0,
         n_obs: int = 0,
         n_labels: int = 0,
+        n_cats_per_cov: Iterable[int] | None = None,
+        n_continuous_cov: int = 0,
+
+        # --- Likelihoods & dispersion (expression) ---
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         gene_dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
-        n_hidden: int = None,
-        n_latent: int = None,
-        n_layers_encoder: int = 2,
-        n_layers_decoder: int = 2,
-        n_continuous_cov: int = 0,
-        n_cats_per_cov: Iterable[int] | None = None,
-        dropout_rate: float = 0.1,
+        use_size_factor_key: bool = False,
+
+        # --- Architecture toggles ---
         splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
         expression_architecture: Literal["vanilla", "linear"] = "vanilla",
-        code_dim: int = 16,
-        h_hidden_dim: int = 64,
-        mlp_encoder_hidden_dim: int = 128,
+
+        # --- Shared SCVI-style encoder/decoder hyperparameters ---
+        n_hidden: int = None,  # width for SCVI encoders/decoders
+        n_latent: int = None,  # latent dim for SCVI encoders/decoders
+        n_layers_encoder: int = 2,
+        n_layers_decoder: int = 2,  # not used by linear decoder
+        dropout_rate: float = 0.1,
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         latent_distribution: Literal["normal", "ln"] = "normal",
         deeply_inject_covariates: bool = False,
         encode_covariates: bool = False,
-        use_size_factor_key: bool = False,
-        splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
-        dm_concentration: Literal["atse", "scalar"] = "atse",
-        splicing_concentration: float | None = None,
 
-        #partialencoderflags
+        # --- Splicing likelihood ---
+        splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
+        splicing_concentration: float | None = None,
+        dm_concentration: Literal["atse", "scalar"] = "atse",
+
+        # --- PartialEncoder (splicing_architecture="partial") knobs ---
+        encoder_type: Literal[
+            "PartialEncoderWeightedSumEDDIMultiWeight",
+            "PartialEncoderWeightedSumEDDIMultiWeightATSE",
+            "PartialEncoderEDDI",
+            "PartialEncoderEDDIATSE"
+        ] = "PartialEncoderEDDI",
+        forward_style: Literal["per-cell", "batched", "scatter"] = "batched",
+        code_dim: int = 16,
+        h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
-        latent_dim: int = 10,
-        encoder_type: Literal["PartialEncoderWeightedSumEDDIMultiWeight","PartialEncoderWeightedSumEDDIMultiWeightATSE","PartialEncoderEDDI","PartialEncoderEDDIATSE"] = "PartialEncoderEDDI",
-        pool_mode: Literal["mean","sum"] = "mean",
+        pool_mode: Literal["mean", "sum"] = "mean",
+        atse_embedding_dimension: int = 16,
         num_weight_vectors: int = 4,
         temperature_value: float = -1.0,
         temperature_fixed: bool = True,
-        forward_style: Literal["per-cell","batched","scatter"] = "batched",
         max_nobs: int = -1,
-        atse_embedding_dimension: int = 16,
 
+        # --- Modality mixing ---
+        modality_weights: Literal["equal", "cell", "universal", "concatenate"] = "equal",
+        modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
+
+        # --- Misc ---
         **model_kwargs,
     ):
+
         super().__init__()
         self.n_input_genes = n_input_genes
         self.n_input_junctions = n_input_junctions
@@ -225,10 +317,11 @@ class MULTIVAESPLICE(BaseModuleClass):
         self.n_batch = n_batch
         self.gene_likelihood = gene_likelihood
         self.latent_distribution = latent_distribution
-        self.n_latent = int(np.sqrt(self.n_hidden)) if n_latent is None else n_latent
-        self.n_latent_original = n_latent
-        if modality_weights == "concatenate":
-            self.n_latent*=2
+
+        base_latent = int(np.sqrt(self.n_hidden)) if n_latent is None else n_latent
+        self.encoder_latent_dim = base_latent
+        self.n_latent = base_latent * (2 if modality_weights == "concatenate" else 1)
+
         self.n_layers_encoder = n_layers_encoder
         self.n_layers_decoder = n_layers_decoder
         self.n_cats_per_cov = n_cats_per_cov
@@ -250,7 +343,6 @@ class MULTIVAESPLICE(BaseModuleClass):
         self.splicing_architecture = splicing_architecture
         self.code_dim = code_dim
         self.h_hidden_dim = h_hidden_dim
-        self.mlp_encoder_hidden_dim = mlp_encoder_hidden_dim
         self.dm_concentration = dm_concentration
 
         cat_list = [n_batch] + list(n_cats_per_cov) if n_cats_per_cov is not None else []
@@ -270,10 +362,9 @@ class MULTIVAESPLICE(BaseModuleClass):
             raise ValueError("gene_dispersion must be one of ['gene', 'gene-batch', 'gene-label', 'gene-cell']")
         input_exp = n_input_genes if n_input_genes > 0 else 1
         n_input_encoder_exp = input_exp + n_continuous_cov * int(encode_covariates)
-        encoderlatentdim = self.n_latent_original
         self.z_encoder_expression = Encoder(
             n_input=n_input_encoder_exp,
-            n_output=encoderlatentdim,
+            n_output=self.encoder_latent_dim,
             n_cat_list=encoder_cat_list,
             n_layers=n_layers_encoder,
             n_hidden=self.n_hidden,
@@ -343,7 +434,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             self.z_encoder_splicing = Encoder(
                 n_input=n_input_encoder_spl,
                 n_layers=n_layers_encoder,
-                n_output=encoderlatentdim,
+                n_output=self.encoder_latent_dim,
                 n_hidden=self.n_hidden,
                 n_cat_list=encoder_cat_list,
                 dropout_rate=dropout_rate,
@@ -371,12 +462,12 @@ class MULTIVAESPLICE(BaseModuleClass):
             if forward_style == "per-cell":
                 if encoder_type == "PartialEncoderEDDI":
                     print(f"Using EDDI Partial Encoder")
-                    self.encoder = PartialEncoderEDDI(
+                    self.z_encoder_splicing = PartialEncoderEDDI(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -386,12 +477,12 @@ class MULTIVAESPLICE(BaseModuleClass):
 
                 elif encoder_type == "PartialEncoderEDDIATSE":
                     print("Using EDDI + ATSE Partial Encoder")
-                    self.encoder = PartialEncoderEDDIATSE(
+                    self.z_encoder_splicing = PartialEncoderEDDIATSE(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -402,12 +493,12 @@ class MULTIVAESPLICE(BaseModuleClass):
                 
                 elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
                     print("Using PartialEncoderWeightedSumEDDIMultiWeight")
-                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeight(
+                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeight(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -419,12 +510,12 @@ class MULTIVAESPLICE(BaseModuleClass):
 
                 elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
                     print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE")
-                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSE(
+                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightATSE(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -437,12 +528,12 @@ class MULTIVAESPLICE(BaseModuleClass):
             elif forward_style == "batched":
                 if encoder_type == "PartialEncoderEDDI":
                     print(f"Using EDDI Partial Encoder Fast")
-                    self.encoder = PartialEncoderEDDIFast(
+                    self.z_encoder_splicing = PartialEncoderEDDIFast(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -452,12 +543,12 @@ class MULTIVAESPLICE(BaseModuleClass):
 
                 elif encoder_type == "PartialEncoderEDDIATSE":
                     print("Using EDDI + ATSE Partial Encoder Fast")
-                    self.encoder = PartialEncoderEDDIATSEFast(
+                    self.z_encoder_splicing = PartialEncoderEDDIATSEFast(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -468,12 +559,12 @@ class MULTIVAESPLICE(BaseModuleClass):
                 
                 elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
                     print("Using PartialEncoderWeightedSumEDDIMultiWeight Fast")
-                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightFast(
+                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightFast(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -485,12 +576,12 @@ class MULTIVAESPLICE(BaseModuleClass):
 
                 elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
                     print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE Fast")
-                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSEFast(
+                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightATSEFast(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -503,12 +594,12 @@ class MULTIVAESPLICE(BaseModuleClass):
             elif forward_style == "scatter":
                 if encoder_type == "PartialEncoderEDDI":
                     print(f"Using EDDI Partial Encoder Faster")
-                    self.encoder = PartialEncoderEDDIFaster(
+                    self.z_encoder_splicing = PartialEncoderEDDIFaster(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -519,12 +610,12 @@ class MULTIVAESPLICE(BaseModuleClass):
 
                 elif encoder_type == "PartialEncoderEDDIATSE":
                     print("Using EDDI + ATSE Partial Encoder Faster")
-                    self.encoder = PartialEncoderEDDIATSEFaster(
+                    self.z_encoder_splicing = PartialEncoderEDDIATSEFaster(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -535,12 +626,12 @@ class MULTIVAESPLICE(BaseModuleClass):
 
                 elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
                     print("Using PartialEncoderWeightedSumEDDIMultiWeight Faster")
-                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightFaster(
+                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightFaster(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -552,12 +643,12 @@ class MULTIVAESPLICE(BaseModuleClass):
 
                 elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
                     print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE Faster")
-                    self.encoder = PartialEncoderWeightedSumEDDIMultiWeightATSEFaster(
+                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightATSEFaster(
                         input_dim=input_spl,
                         code_dim=code_dim,
                         h_hidden_dim=h_hidden_dim,
                         encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=n_latent,
+                        latent_dim=self.encoder_latent_dim,
                         dropout_rate=dropout_rate,
                         n_cat_list=encoder_cat_list,
                         n_cont=n_continuous_cov,
@@ -598,6 +689,14 @@ class MULTIVAESPLICE(BaseModuleClass):
             self.mod_weights = torch.nn.Parameter(torch.ones(max_n_modalities))
         else:
             self.mod_weights = torch.nn.Parameter(torch.ones(n_obs, max_n_modalities))
+        
+        # gate that controls how much of the "other" half a decoder can see (0=off, 1=on)
+        self.register_buffer("cross_gate", torch.tensor(0.0))  # start closed during warmup
+
+    def set_cross_gate(self, value: float):
+        # value in [0,1]; keep as buffer so it's not optimized
+        self.cross_gate.fill_(float(value))
+
 
 
     def _get_inference_input(self, tensors):
@@ -729,7 +828,7 @@ class MULTIVAESPLICE(BaseModuleClass):
 
             qz_m = mix_modalities((qzm_expr, qzm_spl), (mask_expr, mask_spl), weights)
             qz_v = mix_modalities((qzv_expr, qzv_spl), (mask_expr, mask_spl), weights, torch.sqrt)
-            qz_v = torch.clamp(qz_v, min=1e-6)
+            qz_v = torch.clamp(qz_v, min=1e-6) #please double check this variance logic. i think in multivae they treat it like std sometimes and variance other times. need to make it consistet at least in our code
 
         # print(
         #     "After mix:",
@@ -816,36 +915,52 @@ class MULTIVAESPLICE(BaseModuleClass):
             categorical_input = ()
 
         latent = z if not use_z_mean else qz_m
-        if cont_covs is None:
-            decoder_input = latent
-        elif latent.dim() != cont_covs.dim():
-            decoder_input = torch.cat(
-                [latent, cont_covs.unsqueeze(0).expand(latent.size(0), -1, -1)], dim=-1
-            )
+
+        # split halves only if you’re concatenating
+        def _attach_cont(rep):
+            if cont_covs is None:
+                return rep
+            elif rep.dim() != cont_covs.dim():
+                return torch.cat([rep, cont_covs.unsqueeze(0).expand(rep.size(0), -1, -1)], dim=-1)
+            else:
+                return torch.cat([rep, cont_covs], dim=-1)
+
+        if self.modality_weights == "concatenate":
+            d = self.encoder_latent_dim
+            z_e, z_s = latent.split(d, dim=-1)
+
+            gate = self.cross_gate  # 0 during warmup, 1 after
+            # block cross-gradients *and* scale by gate
+            e_to_s = (z_e * gate) # expression half going into splicing decoder
+            s_to_e = (z_s * gate)  # splicing   half going into expression decoder
+
+            dec_in_expr = torch.cat([z_e, s_to_e], dim=-1)
+            dec_in_spl  = torch.cat([e_to_s, z_s], dim=-1)
         else:
-            decoder_input = torch.cat([latent, cont_covs], dim=-1)
-        # Splicing Decoder
+            # not concatenating → same latent for both
+            dec_in_expr = latent
+            dec_in_spl  = latent
+
+        decoder_input_expr = _attach_cont(dec_in_expr)
+        # NOTE: partial splicing decoder expects cont covs via arg, not concatenated
+        decoder_input_spl  = _attach_cont(dec_in_spl) if self.splicing_architecture=="vanilla" else dec_in_spl
+
+        # Splicing
         if self.splicing_architecture == "vanilla":
-            # vanilla Encoder→DecoderSplice expects (decoder_input, batch, *cats)
-            # and decoder_input already has conts baked in upstream
-            p_s = self.z_decoder_splicing(decoder_input, batch_index, *categorical_input)
+            p_s = self.z_decoder_splicing(decoder_input_spl, batch_index, *categorical_input)
         else:
-            # partial: LinearDecoder takes (z, *cat_list, cont=cont_covs)
-            # **do not** concatenate cont_covs into z yourself!
-            p_s_logits = self.z_decoder_splicing(latent, batch_index, *categorical_input, cont=cont_covs)
-            # …then squash into probabilities
+            p_s_logits = self.z_decoder_splicing(dec_in_spl, batch_index, *categorical_input, cont=cont_covs)
             p_s = torch.sigmoid(p_s_logits)
 
-        # Expression Decoder
+        # Expression
         px_scale, _, px_rate, px_dropout = self.z_decoder_expression(
             self.gene_dispersion,
-            decoder_input,
+            decoder_input_expr,   # << use expr-specific input
             libsize_expr,
             batch_index,
             *categorical_input,
             label,
         )
-
         
         # Expression Dispersion
         if self.gene_dispersion == "gene-label":
@@ -861,7 +976,7 @@ class MULTIVAESPLICE(BaseModuleClass):
             "p": p_s, # mean psi 
             "phi": F.softplus(self.log_phi_j), # φ ≈ 100, with overflow protection
             "px_scale": px_scale,
-            "px_r": torch.exp(self.px_r),
+            "px_r": px_r,
             "px_rate": px_rate,
             "px_dropout": px_dropout,
         }
@@ -1217,7 +1332,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         if self.modality_penalty == "None":
             return 0
         elif self.modality_penalty == "Jeffreys":
-            penalty = sym_kld(mod_params_expr[0], mod_params_expr[1].sqrt(),
+            penalty = sym_kld(mod_params_expr[0], mod_params_expr[1].sqrt(), #why are they doing sqrt twice in multivae (orig had this so i kept it the same??)
                                     mod_params_spl[0], mod_params_spl[1].sqrt())
             return penalty[mask].sum()
         elif self.modality_penalty == "MMD":
