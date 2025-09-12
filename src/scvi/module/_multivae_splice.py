@@ -695,7 +695,9 @@ class MULTIVAESPLICE(BaseModuleClass):
 
     def set_cross_gate(self, value: float):
         # value in [0,1]; keep as buffer so it's not optimized
+        # print(f"set_cross_gate, value:{value}")
         self.cross_gate.fill_(float(value))
+        # print(f"set_cross_gate, cross_gate:{self.cross_gate}")
 
 
 
@@ -934,6 +936,10 @@ class MULTIVAESPLICE(BaseModuleClass):
             e_to_s = (z_e * gate) # expression half going into splicing decoder
             s_to_e = (z_s * gate)  # splicing   half going into expression decoder
 
+            # print(f"generative, e_to_s:{e_to_s}")
+            # print(f"generative, s_to_e:{s_to_e}")
+            # print(f"generative, gate:{gate}")
+
             dec_in_expr = torch.cat([z_e, s_to_e], dim=-1)
             dec_in_spl  = torch.cat([e_to_s, z_s], dim=-1)
         else:
@@ -944,6 +950,11 @@ class MULTIVAESPLICE(BaseModuleClass):
         decoder_input_expr = _attach_cont(dec_in_expr)
         # NOTE: partial splicing decoder expects cont covs via arg, not concatenated
         decoder_input_spl  = _attach_cont(dec_in_spl) if self.splicing_architecture=="vanilla" else dec_in_spl
+        
+
+        if torch.rand(1).item() < 0.01: 
+            print(f"expression input {decoder_input_expr}")
+            print(f"splicing input {decoder_input_spl}")
 
         # Splicing
         if self.splicing_architecture == "vanilla":

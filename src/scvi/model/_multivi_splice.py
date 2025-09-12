@@ -123,6 +123,7 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
         # KL warmup drives self.kl_weight from 0→1
         if self.cross_gate_mode == "soft":
             return float(self.kl_weight)                 # gradually open
+        # print(self.kl_weight)
         return 1.0 if float(self.kl_weight) >= 0.999 else 0.0  # snap open when warmup done
     
     def on_validation_epoch_start(self):
@@ -547,7 +548,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
                         self.set_median_obs_temperature()
     
     def set_median_obs_temperature(self):
-        M = self.adata.layers["psi_mask"]
+        M = self.adata["splicing"].layers["psi_mask"]
         if sp.issparse(M):
             # per-row nonzeros, memory-light
             counts = M.tocsr().getnnz(axis=1)
@@ -705,8 +706,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             Additional kwargs to pass to the TrainingPlan constructor.
         **kwargs
             Additional Trainer kwargs (callbacks, strategy, etc.).
-        """
-         
+        """         
         update_dict = {
             "lr": lr,
             "lr_scheduler_type": lr_scheduler_type,
@@ -724,7 +724,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             "optimizer": "AdamW",
             "scale_adversarial_loss": 1,
             "gradient_clipping": gradient_clipping,
-            "gradient_clipping_max_norm": gradient_clipping_max_norm,
+            "gradient_clipping_max_norm": gradient_clipping_max_norm,    
         }
         if plan_kwargs is not None:
             plan_kwargs.update(update_dict)
@@ -765,6 +765,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             early_stopping=early_stopping,
             check_val_every_n_epoch=check_val_every_n_epoch,
             early_stopping_monitor="reconstruction_loss_validation",
+            early_stopping_warmup_epochs= n_epochs_kl_warmup,
             early_stopping_patience=early_stopping_patience,
             **kwargs,
         )
