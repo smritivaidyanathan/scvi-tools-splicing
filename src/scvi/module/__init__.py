@@ -8,13 +8,14 @@ from ._multivae_splice import MULTIVAESPLICE
 from ._peakvae import PEAKVAE
 from ._scanvae import SCANVAE
 from ._totalvae import TOTALVAE
-from ._vae import LDVAE, VAE
+from ._vae import LDVAE, VAE, VAE_Linear
 from ._vaec import VAEC
 from ._partialvae import PARTIALVAE
 
 __all__ = [
     "VAE",
     "LDVAE",
+    "VAE_Linear",
     "TOTALVAE",
     "AutoZIVAE",
     "SCANVAE",

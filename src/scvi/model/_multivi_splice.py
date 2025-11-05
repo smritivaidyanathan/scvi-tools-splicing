@@ -1043,7 +1043,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         if indices is None:
             indices = np.arange(adata.n_obs)
         if n_samples_overall is not None:
-            indices = np.random.choice(indices, size=n_samples_overall, replace=False)
+            indices = np.random.choice(indices, size=n_samples_overall)
 
         # Data loader
         scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
@@ -1098,124 +1098,194 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         )
         return pd.DataFrame(spls, index=adata.obs_names[indices], columns=cols)
 
-
-
-    @de_dsp.dedent
-    def differential_splicing(
+    @torch.inference_mode()
+    def get_normalized_splicing_DM(
         self,
-        adata: AnnData | None = None,
-        groupby: str | None = None,
-        group1: Iterable[str] | None = None,
-        group2: str | None = None,
-        idx1: Sequence[int] | Sequence[bool] | None = None,
-        idx2: Sequence[int] | Sequence[bool] | None = None,
-        mode: Literal["vanilla", "change"] = "change",
-        delta: float = 0.05,
+        adata: AnnOrMuData | None = None,
+        indices: Sequence[int] | None = None,
+        n_samples_overall: int | None = None,
+        transform_batch: Sequence[Number | str] | None = None,
+        junction_list: Sequence[str] | None = None,
+        use_z_mean: bool = True,
+        n_samples: int = 1,
         batch_size: int | None = None,
-        all_stats: bool = True,
-        batch_correction: bool = False,
-        batchid1: Iterable[str] | None = None,
-        batchid2: Iterable[str] | None = None,
-        fdr_target: float = 0.05,
-        silent: bool = False,
-        **kwargs,
-    ) -> pd.DataFrame:
-        r"""Differential splicing analysis.
+        return_mean: bool = True,
+        return_numpy: bool = False,
+        silent: bool = True,
+    ) -> np.ndarray | pd.DataFrame:
+        r"""Returns **DM-normalized** splicing probabilities (PSI*).
 
-        Performs a unified differential analysis on junction usage ratios analogous to
-        the 'vanilla' and 'change' methods in scVI for gene expression.
-        This method compares splicing (junction usage) between groups.
+        This decodes junction PSI (:math:`p`) and applies a Dirichlet–multinomial
+        posterior mean smoothing per junction:
+        :math:`\psi^\* = (c p + y_j) / (c + n)`,
+        where :math:`y_j` is the observed junction count and :math:`n` is the
+        observed ATSE total for that junction. The concentration :math:`c` is
+        taken from the module:
+        * If ``self.dm_concentration == "atse"``: use the per-ATSE values in
+            ``self.module.log_phi_j`` mapped to per-junction via
+            ``self.module.junc2atse``.
+        * Otherwise: treat ``self.module.log_phi_j`` as a scalar concentration.
 
         Parameters
         ----------
-        %(de_adata)s
-        %(de_groupby)s
-        %(de_group1)s
-        %(de_group2)s
-        %(de_idx1)s
-        %(de_idx2)s
-        %(de_mode)s
-        %(de_delta)s
-        %(de_batch_size)s
-        %(de_all_stats)s
-        %(de_batch_correction)s
-        %(de_batchid1)s
-        %(de_batchid2)s
-        %(de_fdr_target)s
-        %(de_silent)s
-        two_sided
-            Whether to perform a two-sided test.
-        **kwargs
-            Additional keyword arguments for differential computation.
+        adata
+            AnnOrMuData object with equivalent structure to initialization.
+            If `None`, defaults to the object used to initialize the model.
+        indices
+            Indices of cells in `adata` to use. If `None`, all cells are used.
+        n_samples_overall
+            Number of observations to sample from ``indices`` if provided.
+        transform_batch
+            Batch conditioning:
+            - None: use observed batch
+            - int/str: force decode to that batch
+            - list[int|str]: average decoded outputs over listed batches
+        junction_list
+            Optional subset of junction names to return.
+        use_z_mean
+            If True, decode from the mean of the latent; else sample.
+        n_samples
+            Posterior samples to draw. If >1 and `return_mean` is True, results are
+            averaged over samples.
+        batch_size
+            Minibatch size for decoding.
+        return_mean
+            If True and `n_samples` > 1, average samples before returning.
+        return_numpy
+            If True, return a NumPy array; else a pandas DataFrame.
+        silent
+            If True, disables progress display.
 
         Returns
         -------
-        A pandas DataFrame with differential splicing results including:
-            - prob_da: probability of differential splicing,
-            - is_da_fdr: FDR-based significance,
-            - bayes_factor, effect_size, empirical effects, etc.
+        Array or DataFrame of shape ``(cells, junctions)`` with DM-normalized PSI*.
         """
+        # Validate and prepare
         self._check_adata_modality_weights(adata)
         adata = self._validate_anndata(adata)
-        col_names = adata.var_names[self.n_genes : self.n_genes + self.n_junctions]
-        model_fn = partial(
-            self.get_normalized_splicing, use_z_mean=False, batch_size=batch_size
-        )
+        adata_manager = self.get_anndata_manager(adata, required=True)
 
-        def change_fn(a, b):
-            return a - b
+        # Select cells
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        if n_samples_overall is not None:
+            indices = np.random.choice(indices, size=n_samples_overall)
 
-        two_sided = kwargs.pop("two_sided", True)
-        if two_sided:
-            def m1_domain_fn(samples):
-                return np.abs(samples) >= delta
+        # Data loader
+        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+
+        # Batches to transform over
+        transform_batch = _get_batch_code_from_category(adata_manager, transform_batch)
+
+        # Junction mask and column names
+        all_junc = adata.var_names[self.n_genes : self.n_genes + self.n_junctions]
+        if junction_list is None:
+            junction_mask = slice(None)
+            out_cols = list(all_junc)
         else:
-            def m1_domain_fn(samples):
-                return samples >= delta
+            keep = [j in junction_list for j in all_junc]
+            junction_mask = keep
+            out_cols = [j for j, k in zip(all_junc, keep) if k]
 
-        all_stats_fn = partial(
-            scrna_raw_counts_properties,
-            var_idx=np.arange(adata.shape[1])[self.n_genes : self.n_genes + self.n_junctions],
-        )
+        eps = 1e-8
+        results = []
 
-        result = _de_core(
-            adata_manager=self.get_anndata_manager(adata, required=True),
-            model_fn=model_fn,
-            representation_fn=None,
-            groupby=groupby,
-            group1=group1,
-            group2=group2,
-            idx1=idx1,
-            idx2=idx2,
-            all_stats=all_stats,
-            all_stats_fn=all_stats_fn,
-            col_names=col_names,
-            mode=mode,
-            batchid1=batchid1,
-            batchid2=batchid2,
-            delta=delta,
-            batch_correction=batch_correction,
-            fdr=fdr_target,
-            change_fn=change_fn,
-            m1_domain_fn=m1_domain_fn,
-            silent=silent,
-            **kwargs,
-        )
-        result = pd.DataFrame(
-            {
-                "prob_da": result.proba_de,
-                "is_da_fdr": result.loc[:, f"is_de_fdr_{fdr_target}"],
-                "bayes_factor": result.bayes_factor,
-                "effect_size": result.scale2 - result.scale1,
-                "emp_effect": result.emp_mean2 - result.emp_mean1,
-                "est_prob1": result.scale1,
-                "est_prob2": result.scale2,
-                "emp_prob1": result.emp_mean1,
-                "emp_prob2": result.emp_mean2,
-            },
-            index=col_names,
-        )
-        return result
+        for tensors in scdl:
+            # Precompute per-junction concentration c_j
+            device = next(self.module.parameters()).device
+            # softplus to ensure positivity
+            raw_phi = torch.nn.functional.softplus(self.module.log_phi_j)
+
+            if self.dm_concentration == "atse":
+                # map per-ATSE phi (G,) to per-junction (J,) via JxG map
+                j2a = self.module.junc2atse
+                if j2a.device != device:
+                    j2a = j2a.to(device)
+                if raw_phi.dim() != 1:
+                    raise RuntimeError("Expected per-ATSE phi as 1-D when dm_concentration='atse'.")
+                # (J,G) @ (G,1) -> (J,)
+                phi_j = torch.sparse.mm(j2a, raw_phi.unsqueeze(1)).squeeze(1)
+            else:
+                # scalar phi
+                phi_j = raw_phi.reshape(1)  # shape (1,) broadcast later
+
+            # Pull counts for this minibatch
+            y = tensors.get("junc_counts_key", None)
+            n = tensors.get("atse_counts_key", None)
+            if y is None or n is None:
+                raise RuntimeError("Both 'junc_counts_key' and 'atse_counts_key' must be present for DM-normalized PSI.")
+            y = y.to(device).float()
+            n = n.to(device).float()
+
+            # Optional junction subsetting done after decoding; counts must match mask too
+            if isinstance(junction_mask, list):
+                y = y[:, junction_mask]
+                n = n[:, junction_mask]
+
+            per_batch_psis = []
+            for batch in track(transform_batch, disable=silent):
+                if batch is not None:
+                    b_idx = tensors[REGISTRY_KEYS.BATCH_KEY]
+                    tensors[REGISTRY_KEYS.BATCH_KEY] = torch.ones_like(b_idx) * batch
+
+                # Decode p exactly like the original method
+                _, generative_outputs = self.module.forward(
+                    tensors=tensors,
+                    inference_kwargs={"n_samples": n_samples},
+                    generative_kwargs={"use_z_mean": use_z_mean},
+                    compute_loss=False,
+                )
+                p = generative_outputs["p"]  # shape: (S?, B, J) or (B, J)
+                # Apply junction selection to decoded p
+                if isinstance(junction_mask, list):
+                    p = p[..., junction_mask]
+
+                # Build phi broadcast to p’s shape
+                if p.dim() == 3:
+                    # (S, B, J)
+                    if phi_j.dim() == 1:
+                        phi = phi_j.unsqueeze(0).unsqueeze(0)  # (1,1,J)
+                    else:
+                        phi = phi_j  # scalar → broadcast
+                    y_b = y.unsqueeze(0)  # (1, B, J)
+                    n_b = n.unsqueeze(0)  # (1, B, J)
+                else:
+                    # (B, J)
+                    if phi_j.dim() == 1:
+                        phi = phi_j.unsqueeze(0)  # (1, J)
+                    else:
+                        phi = phi_j  # scalar → broadcast
+                    y_b = y
+                    n_b = n
+
+                # Compute DM-smoothed PSI*
+                psi_star = (phi * p + y_b) / (phi + n_b + eps)
+                psi_star = psi_star.clamp(eps, 1.0 - eps)
+
+                per_batch_psis.append(psi_star)
+
+            # average over transform_batch list
+            psi_mb = torch.stack(per_batch_psis, dim=0).mean(0)  # keep sample dim if present
+            results.append(psi_mb)
+
+        # Concatenate minibatches along cells
+        psis = torch.cat(results, dim=-2)  # align with original method behavior
+
+        # If multiple samples and return_mean, average over samples
+        if psis.dim() == 3 and return_mean:
+            psis = psis.mean(0)  # (B, J)
+
+        psis_np = psis.detach().cpu().numpy()
+
+        if return_numpy:
+            return psis_np
+        else:
+            return pd.DataFrame(
+                psis_np,
+                index=adata.obs_names[indices],
+                columns=out_cols,
+            )
+
 
     @torch.inference_mode()
     def differential_expression(
@@ -1299,6 +1369,160 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             **kwargs,
         )
         return result
+
+
+    @torch.inference_mode()
+    def differential_splicing(
+        self,
+        adata: AnnData | None = None,
+        groupby: str | None = None,
+        group1: Iterable[str] | None = None,
+        group2: str | None = None,
+        idx1: Sequence[int] | Sequence[bool] | None = None,
+        idx2: Sequence[int] | Sequence[bool] | None = None,
+        mode: Literal["vanilla", "change"] = "change",
+        delta: float = 0.10,
+        batch_size: int | None = None,
+        all_stats: bool = True,
+        batch_correction: bool = False,
+        batchid1: Iterable[str] | None = None,
+        batchid2: Iterable[str] | None = None,
+        fdr_target: float = 0.05,
+        silent: bool = False,
+        norm_splicing_function: Literal["decoder", "dm_posterior_mean"] = "decoder",
+        **kwargs,
+    ) -> pd.DataFrame:
+        r"""Differential splicing analysis.
+
+        Performs differential junction usage analysis using normalized PSI
+        from the model's splicing decoder.
+
+        Parameters
+        ----------
+        %(de_adata)s
+        %(de_groupby)s
+        %(de_group1)s
+        %(de_group2)s
+        %(de_idx1)s
+        %(de_idx2)s
+        %(de_mode)s
+        %(de_delta)s
+        %(de_batch_size)s
+        %(de_all_stats)s
+        %(de_batch_correction)s
+        %(de_batchid1)s
+        %(de_batchid2)s
+        %(de_fdr_target)s
+        %(de_silent)s
+        **kwargs
+            Additional keyword arguments for differential computation.
+
+        Returns
+        -------
+        A pandas DataFrame with differential splicing results.
+        """
+
+        def scsplicing_ratio_properties(
+            adata_manager: AnnDataManager,
+            idx1: list[int] | np.ndarray,
+            idx2: list[int] | np.ndarray,
+            var_idx: list[int] | np.ndarray | None = None,
+        ) -> dict[str, np.ndarray]:
+            """Empirical PSI means and effect on the junc_ratio matrix.
+
+            Pulls PSI from REGISTRY_KEYS.JUNC_RATIO_X_KEY and returns:
+            emp_mean1, emp_mean2, emp_effect = mean1 - mean2
+            """
+            X = adata_manager.get_from_registry(REGISTRY_KEYS.JUNC_RATIO_X_KEY) # cells x junctions
+
+            X1 = X[idx1]
+            X2 = X[idx2]
+            if var_idx is not None:
+                X1 = X1[:, var_idx]
+                X2 = X2[:, var_idx]
+
+            # Works for dense or sparse
+            mean1 = np.asarray(X1.mean(axis=0)).ravel()
+            mean2 = np.asarray(X2.mean(axis=0)).ravel()
+
+            return {
+                "emp_mean1": mean1,
+                "emp_mean2": mean2,
+                "emp_effect": (mean1 - mean2),
+            }
+        
+        self._check_adata_modality_weights(adata)
+        adata = self._validate_anndata(adata)
+        print(adata)
+        print(adata.var_names.shape)
+        print(adata["splicing"].var_names.shape)
+
+        col_names = adata["splicing"].var["junction_id"][: self.n_junctions]
+
+        # Use expected PSI from the splicing head
+
+        if norm_splicing_function == "decoder":
+            model_fn = partial(
+                self.get_normalized_splicing,
+                batch_size=batch_size,
+            )
+        elif norm_splicing_function == "dm_posterior_mean":
+            model_fn = partial(
+                self.get_normalized_splicing_DM,
+                batch_size=batch_size,
+            )
+        else:
+            print("Unrecognized Normalized Splicing Mode, defaulting to regular decoder output.")
+            model_fn = partial(
+                self.get_normalized_splicing,
+                batch_size=batch_size,
+            )
+
+
+        # Minimal empirical stats on PSI itself
+        all_stats_fn = partial(
+            scsplicing_ratio_properties,
+            var_idx=np.arange(adata["splicing"].shape[1])[: self.n_junctions],
+        )
+
+        result = _de_core(
+            adata_manager=self.get_anndata_manager(adata, required=True),
+            model_fn=model_fn,
+            representation_fn=None,
+            groupby=groupby,
+            group1=group1,
+            group2=group2,
+            idx1=idx1,
+            idx2=idx2,
+            all_stats=all_stats,
+            all_stats_fn=all_stats_fn,
+            col_names=col_names,
+            mode=mode,
+            batchid1=batchid1,
+            batchid2=batchid2,
+            delta=delta,
+            batch_correction=batch_correction,
+            fdr=fdr_target,
+            silent=silent,
+            pseudocounts=1e-6,
+            **kwargs,
+        )
+        result = pd.DataFrame(
+            {
+                "proba_ds": result.proba_de,
+                "is_ds_fdr": result.loc[:, f"is_de_fdr_{fdr_target}"],
+                "bayes_factor": result.bayes_factor,
+                "effect_size": result.scale2 - result.scale1,
+                "emp_effect": result.emp_mean2 - result.emp_mean1,
+                "est_prob1": result.scale1,
+                "est_prob2": result.scale2,
+                "emp_prob1": result.emp_mean1,
+                "emp_prob2": result.emp_mean2,
+            },
+            index=col_names,
+        )
+        return result
+
 
     @classmethod
     @setup_anndata_dsp.dedent

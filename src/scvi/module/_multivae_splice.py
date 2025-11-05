@@ -2,6 +2,7 @@ from collections.abc import Iterable
 from typing import Literal
 
 import numpy as np
+import random
 import torch
 from torch import nn
 from torch.distributions import Normal, Poisson
@@ -817,8 +818,23 @@ class MULTIVAESPLICE(BaseModuleClass):
 
 
         # mix representations
+        warmup_only_splicing = (
+            self.modality_weights != "concatenate"
+            and float(self.cross_gate.item()) < 1.0
+        )
+        if warmup_only_splicing:
+            # During warmup, route only the splicing posterior into the shared latent.
+            # This makes both decoders use splicing information in the generative step.
 
-        if self.modality_weights == "concatenate":
+            result = random.choice(["splicing", "expression"])
+            if result == "splicing":
+                qz_m = qzm_spl
+                qz_v = qzv_spl
+            else:
+                qz_m = qzm_expr
+                qz_v = qzv_expr
+            
+        elif self.modality_weights == "concatenate":
             # just glue the two posterior stats end-to-end
             qz_m = torch.cat((qzm_expr, qzm_spl), dim=1)
             qz_v = torch.cat((qzv_expr, qzv_spl), dim=1)
@@ -1123,19 +1139,10 @@ class MULTIVAESPLICE(BaseModuleClass):
         if self.training and torch.rand(1).item() < 0.01:  # 1% of iterations
             phi_values = generative_outputs["phi"]
             gene_dispersion = generative_outputs["px_r"]  # Gene concentration parameters
-            print(f"φ stats: min={phi_values.min().item():.2f}, "
-              f"max={phi_values.max().item():.2f}, "
-              f"median={phi_values.median().item():.2f}")
-
-            print(f"θ_g (gene disp):     min={gene_dispersion.min().item():.2f}, "
-              f"max={gene_dispersion.max().item():.2f}, "
-              f"median={gene_dispersion.median().item():.2f}")
-    
             # Compare them
             phi_median = phi_values.median().item()
             gene_median = gene_dispersion.median().item()
             ratio = phi_median / gene_median if gene_median > 0 else float('inf')
-            print(f"φ_j/θ_g ratio: {ratio:.2f}")
 
         kl_local = {
             "kl_divergence_z": kl_div_z,
@@ -1335,7 +1342,7 @@ class MULTIVAESPLICE(BaseModuleClass):
         Tensor
             A scalar penalty computed over cells where both modalities are observed.
         """
-
+        return torch.tensor(0.0, device=next(self.parameters()).device)
         mask = torch.logical_and(mask1, mask2)
         if self.modality_weights == "concatenate":
             return torch.tensor(0.0, device=next(self.parameters()).device)

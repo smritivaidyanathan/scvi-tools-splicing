@@ -880,35 +880,42 @@ class PartialEncoderEDDIFaster(nn.Module):
             mu, logvar = mu_logvar.chunk(2, dim=-1)
             return mu, logvar
 
+        # Precompute a normalized copy once (avoids re-normalizing the same rows repeatedly)
+        # Do this where F_j is defined / available before the if/else:
+        F_j_norm = F.normalize(F_j, p=2, dim=1, eps=1e-8)   # (J, D)
+
         if (self.max_nobs < 0) or (N_obs <= self.max_nobs):
             # ---- Original (no chunking) path ----
-            x_obs = x[b_idx, j_idx].unsqueeze(1)       # (N_obs, 1)
-            F_obs = F_j.index_select(0, j_idx)         # (N_obs, D)
+            x_obs = x[b_idx, j_idx].unsqueeze(1)                  # (N_obs, 1)
+            F_obs = F_j_norm.index_select(0, j_idx)               # (N_obs, D), already L2-normalized
 
-            h_in  = torch.cat([x_obs, F_obs], dim=1)   # (N_obs, 1 + D)
-            h_obs = self.h_layer(h_in)                 # (N_obs, D)
+            F_obs_scaled = F_obs * x_obs                          # broadcast scale by usage ratio
+            h_in  = torch.cat([x_obs, F_obs_scaled], dim=1)       # (N_obs, 1 + D)
+            h_obs = self.h_layer(h_in)                            # (N_obs, D)
 
             pooled = torch.zeros(B, D, device=device, dtype=h_obs.dtype)
-            pooled.index_add_(0, b_idx, h_obs)         # sum over observed rows per cell
+            pooled.index_add_(0, b_idx, h_obs)
 
         else:
             # ---- Chunked path: same result, steadier memory ----
-            pooled = None  # defer dtype until we see h_out
+            pooled = None
             for start in range(0, N_obs, self.max_nobs):
                 end = min(start + self.max_nobs, N_obs)
 
-                bi = b_idx[start:end]                  # (n,)
-                jj = j_idx[start:end]                  # (n,)
+                bi = b_idx[start:end]                             # (n,)
+                jj = j_idx[start:end]                             # (n,)
 
-                x_chunk = x[bi, jj].unsqueeze(1)       # (n, 1)
-                F_chunk = F_j.index_select(0, jj)      # (n, D)
+                x_chunk = x[bi, jj].unsqueeze(1)                  # (n, 1)
+                F_chunk = F_j_norm.index_select(0, jj)            # (n, D), already L2-normalized
 
-                h_in  = torch.cat([x_chunk, F_chunk], dim=1)  # (n, 1 + D)
-                h_out = self.h_layer(h_in)                     # (n, D)
+                F_chunk_scaled = F_chunk * x_chunk                # scale by usage ratio
+                h_in  = torch.cat([x_chunk, F_chunk_scaled], dim=1)  # (n, 1 + D)
+                h_out = self.h_layer(h_in)                           # (n, D)
 
                 if pooled is None:
                     pooled = torch.zeros(B, D, device=device, dtype=h_out.dtype)
                 pooled.index_add_(0, bi, h_out)
+
 
         # Mean pooling if requested
         if self.pool_mode == "mean":

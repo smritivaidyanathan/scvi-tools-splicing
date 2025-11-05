@@ -6,6 +6,7 @@ from ._destvi import DestVI
 from ._jaxscvi import JaxSCVI
 from ._linear_scvi import LinearSCVI
 from ._multivi import MULTIVI
+from ._scvi_lin import SCVI_Linear
 from ._multivi_splice import MULTIVISPLICE
 from ._peakvi import PEAKVI
 from ._scanvi import SCANVI
@@ -27,6 +28,7 @@ __all__ = [
     "MULTIVISPLICE",
     "AmortizedLDA",
     "SPLICEVI",
+    "SCVI_Linear",
     "utils",
     "JaxSCVI",
 ]
