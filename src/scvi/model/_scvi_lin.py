@@ -19,13 +19,28 @@ from scvi.model._utils import _init_library_size
 from scvi.model.base import EmbeddingMixin, UnsupervisedTrainingMixin
 from scvi.module import VAE_Linear
 from scvi.utils import setup_anndata_dsp
+import torch
+import numpy as np
+import pandas as pd
+from functools import partial
+from scvi.model.base._de_core import _de_core
+
+from scvi.model._utils import (
+    _get_batch_code_from_category,
+    scrna_raw_counts_properties,
+    use_distributed_sampler,
+)
 
 from .base import ArchesMixin, BaseMinifiedModeModelClass, RNASeqMixin, VAEMixin
 
 if TYPE_CHECKING:
     from typing import Literal
-
+    from collections.abc import Iterable, Sequence
+    from scvi._types import Number
     from anndata import AnnData
+
+
+
 
 logger = logging.getLogger(__name__)
 

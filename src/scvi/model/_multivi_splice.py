@@ -1193,11 +1193,9 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         for tensors in scdl:
             # Precompute per-junction concentration c_j
             device = next(self.module.parameters()).device
-            # softplus to ensure positivity
             raw_phi = torch.nn.functional.softplus(self.module.log_phi_j)
 
             if self.dm_concentration == "atse":
-                # map per-ATSE phi (G,) to per-junction (J,) via JxG map
                 j2a = self.module.junc2atse
                 if j2a.device != device:
                     j2a = j2a.to(device)
@@ -1205,9 +1203,19 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
                     raise RuntimeError("Expected per-ATSE phi as 1-D when dm_concentration='atse'.")
                 # (J,G) @ (G,1) -> (J,)
                 phi_j = torch.sparse.mm(j2a, raw_phi.unsqueeze(1)).squeeze(1)
+
+                # subset phi_j to match junction_mask
+                if isinstance(junction_mask, list):
+                    if len(junction_mask) != phi_j.shape[0]:
+                        raise RuntimeError(
+                            f"junction_mask length ({len(junction_mask)}) does not match phi_j "
+                            f"length ({phi_j.shape[0]})."
+                        )
+                    phi_j = phi_j[junction_mask]
             else:
                 # scalar phi
-                phi_j = raw_phi.reshape(1)  # shape (1,) broadcast later
+                phi_j = raw_phi.reshape(1)
+
 
             # Pull counts for this minibatch
             y = tensors.get("junc_counts_key", None)
@@ -1389,7 +1397,7 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
         batchid2: Iterable[str] | None = None,
         fdr_target: float = 0.05,
         silent: bool = False,
-        norm_splicing_function: Literal["decoder", "dm_posterior_mean"] = "decoder",
+        norm_splicing_function: Literal["decoder", "dm_posterior_mean"] = "dm_posterior_mean",
         **kwargs,
     ) -> pd.DataFrame:
         r"""Differential splicing analysis.
@@ -1431,33 +1439,67 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             """Empirical PSI means and effect on the junc_ratio matrix.
 
             Pulls PSI from REGISTRY_KEYS.JUNC_RATIO_X_KEY and returns:
-            emp_mean1, emp_mean2, emp_effect = mean1 - mean2
+            emp_mean1, emp_mean2, emp_effect = mean2 - mean1
+            Observed counts per junction in each group are also returned:
+            obs_count1, obs_count2.
+            Means are computed only across observed (mask=1) junctions.
+            If a junction is not observed in any cell in a group, its mean is set to -1.
             """
-            X = adata_manager.get_from_registry(REGISTRY_KEYS.JUNC_RATIO_X_KEY) # cells x junctions
+            X = adata_manager.get_from_registry(REGISTRY_KEYS.JUNC_RATIO_X_KEY)  # (cells x junctions)
+            M = adata_manager.get_from_registry(REGISTRY_KEYS.PSI_MASK_KEY)      # (cells x junctions), 0/1
 
-            X1 = X[idx1]
-            X2 = X[idx2]
+            X1, X2 = X[idx1], X[idx2]
+            M1, M2 = M[idx1], M[idx2]
+
             if var_idx is not None:
-                X1 = X1[:, var_idx]
-                X2 = X2[:, var_idx]
+                X1, X2 = X1[:, var_idx], X2[:, var_idx]
+                M1, M2 = M1[:, var_idx], M2[:, var_idx]
 
-            # Works for dense or sparse
-            mean1 = np.asarray(X1.mean(axis=0)).ravel()
-            mean2 = np.asarray(X2.mean(axis=0)).ravel()
+            def _to_ndarray(A):
+                # Works for dense, sparse, and numpy.matrix
+                if hasattr(A, "toarray"):
+                    return A.toarray()
+                return np.asarray(A)
+
+            def masked_mean_and_counts(X_sub, M_sub):
+                """Compute mean across observed entries only, plus observed counts."""
+                X_sub = _to_ndarray(X_sub)
+                M_sub = _to_ndarray(M_sub)
+
+                # Ensure numeric mask (0/1) and float data
+                M_sub = M_sub.astype(np.float32, copy=False)
+                X_sub = X_sub.astype(np.float32, copy=False)
+
+                # Elementwise multiply; sums over cells -> per-junction vectors
+                observed_sum = (X_sub * M_sub).sum(axis=0)
+                observed_count = M_sub.sum(axis=0)
+
+                # Safe division with fallback -1 where no observations
+                mean = np.divide(
+                    observed_sum,
+                    observed_count,
+                    out=np.full_like(observed_sum, -1.0, dtype=np.float32),
+                    where=observed_count > 0,
+                )
+                # Return 1D vectors
+                return mean.ravel(), observed_count.ravel()
+
+            mean1, obs_count1 = masked_mean_and_counts(X1, M1)
+            mean2, obs_count2 = masked_mean_and_counts(X2, M2)
 
             return {
                 "emp_mean1": mean1,
                 "emp_mean2": mean2,
-                "emp_effect": (mean1 - mean2),
+                "emp_effect": mean2 - mean1,
+                "obs_count1": obs_count1,  # number of cells that observed each junction in idx1
+                "obs_count2": obs_count2,  # number of cells that observed each junction in idx2
             }
-        
+
         self._check_adata_modality_weights(adata)
         adata = self._validate_anndata(adata)
-        print(adata)
-        print(adata.var_names.shape)
-        print(adata["splicing"].var_names.shape)
 
-        col_names = adata["splicing"].var["junction_id"][: self.n_junctions]
+        col_names = adata["splicing"].var_names
+
 
         # Use expected PSI from the splicing head
 
@@ -1521,6 +1563,19 @@ class MULTIVISPLICE(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesM
             },
             index=col_names,
         )
+
+        var_cols = adata["splicing"].var
+        wanted = [c for c in ["junction_id", "gene_name"] if c in var_cols.columns]
+        if wanted:
+            meta = var_cols.loc[col_names, wanted]  # reindex to the same junctions in the same order
+            result = result.join(meta)
+
+
+        if "junction_id" in result.columns:
+            result.insert(0, "junction_id", result.pop("junction_id"))
+        if "gene_name" in result.columns:
+            result.insert(1, "gene_name", result.pop("gene_name"))
+
         return result
 
 
